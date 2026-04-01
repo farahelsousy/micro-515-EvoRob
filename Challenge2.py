@@ -16,6 +16,8 @@ from evorob.world.ant_multi_world import AntMultiWorld
 from evorob.world.ant_world import AntFlatWorld
 from evorob.world.envs.ant_flat import AntFlatEnvironment
 from evorob.world.robot.controllers.mlp import NeuralNetworkController
+import matplotlib
+matplotlib.use('Agg')
 
 """
     Multi-objective optimisation: Ant two-terrains
@@ -809,7 +811,7 @@ if __name__ == "__main__":
 
     # Uncomment to run full NSGA-II evolution:
     run_evolution_nsga(
-        num_generations=100,
+        num_generations=2,
         population_size=10,
         run_evaluation=False,
         compute_score=True,
@@ -822,13 +824,14 @@ if __name__ == "__main__":
         ckpt_interval=5,
         checkpoint_path=None,
     )
-
+"""
     # Uncomment to replay your checkpoint
-    # replay_checkpoint(
-    #     checkpoint_path="./results/nsga_multi_terrain_ckpt/99"
-    # )
+    replay_checkpoint(
+         checkpoint_path="./results/nsga_multi_terrain_ckpt/99"
+     )
 
     # Uncomment to plot Pareto fronts from checkpoint
-    # plot_pareto_fronts_from_checkpoint(
-    #     checkpoint_dir="./results/nsga_multi_terrain_ckpt/99"
-    # )
+    plot_pareto_fronts_from_checkpoint(
+         checkpoint_dir="./results/nsga_multi_terrain_ckpt/99"
+     )
+"""
