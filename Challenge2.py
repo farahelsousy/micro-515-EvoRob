@@ -212,7 +212,7 @@ class CompatibleHybridAntController(PhaseHybridResidualController):
             hidden_size=self.BASE_HIDDEN,
         )
 
-        ppo_path = os.environ.get("/Users/farahelsousy/Desktop/evolutionary_robotics/micro-515-EvoRob/results/ppo_ckpts/ppo_ant_10000000_steps", "").strip()
+        ppo_path = os.environ.get("PPO_PATH", "").strip()
         if ppo_path and os.path.isfile(ppo_path):
             try:
                 from stable_baselines3 import PPO
@@ -980,18 +980,21 @@ def replay_checkpoint(checkpoint_path: str):
 if __name__ == "__main__":
     test_exercise_implementation()
     run_evolution_nsga(
-    num_generations=100,
-    population_size=100,
-    n_parents=50,       # 50% selection pressure is the standard for NSGA-II
-    n_repeats=6,        # Enough to average out the slippery ice variance
-    mutation_prob=0.05, # Low mutation preserves the PPO gait
-    crossover_prob=0.5, # Balanced crossover for diversity
-    bounds=(-0.1, 0.1), # Keeps residuals from breaking the robot
-    ckpt_interval=20,
-    compute_score=True,
-    random_seed=42,
-    run_evaluation=False, # Set to True to run the interactive evaluation after training
-    )
+            num_generations=100,
+            population_size=100,
+            n_parents=50,         # High selection pressure
+            n_repeats=4,         # Heavy filtering for Ice luck
+            mutation_prob=0.03,   # Slightly higher to explore faster
+            crossover_prob=0.8,
+            bounds=(-0.06, 0.06),   # Give the evolution more "room" to move
+            # In hybrid.py, ensure residual_scale is at least 0.15 or 0.2
+            compute_score=True,
+            run_evaluation=False  ,
+            random_seed=42,
+            ckpt_interval=20,
+
+        )
+    
 """
     # Uncomment to replay your checkpoint
     replay_checkpoint(
