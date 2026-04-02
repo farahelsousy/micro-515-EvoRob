@@ -45,7 +45,7 @@ class PPOOnlyAntController:
     """
 
     BASE_HIDDEN = [256, 256]
-    PPO_PATH = "results/ppo_ckpts/ppo_ant_10000000_steps.zip"
+    PPO_PATH = "micro-515-EvoRob/results/ppo_ckpts_both/ppo_ant_both_4000000_steps.zip"
 
     def __init__(self, input_size, output_size):
         obs_dim = int(input_size)
@@ -855,8 +855,8 @@ def replay_checkpoint(checkpoint_path: str):
 if __name__ == "__main__":
     test_exercise_implementation()
     run_evolution_nsga(
-        num_generations=5,
-        population_size=5,
+        num_generations=50,
+        population_size=120,
         n_parents=50,
         n_repeats=6,
         mutation_prob=0.02,
