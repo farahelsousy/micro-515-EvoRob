@@ -130,7 +130,7 @@ class NSGAII(EA):
 
         # Select best n_pop individuals from combined population
         parents_population, parents_fitness = self.sort_and_select_parents(
-            combined_population, combined_fitness, self.n_parents
+            combined_population, combined_fitness, self.n_pop
         )
 
         self.current_population = parents_population
@@ -180,54 +180,53 @@ class NSGAII(EA):
         )
 
     def create_children(self, population_size: int) -> np.ndarray:
-        """Creates offspring using tournament selection, mutation and crossover.
-
-        Uses tournament selection based on Pareto rank and crowding distance
-        to select parents, then applies differential evolution mutation.
-
-        Args:
-            population_size (int): Number of offspring to generate.
-
-        Returns:
-            np.ndarray: Mutated and clipped offspring population.
-        """
+        """Creates offspring from a selected parent pool of size n_parents."""
         new_offspring = np.empty((population_size, self.n_params))
 
-        # Compute ranks and crowding distances for tournament selection
-        fronts, ranks = self.fast_nondominated_sort(self.fitness)
-        crowding = np.zeros(len(self.fitness))
+        # Build mating pool from the current survivor population
+        parent_pool, parent_fitness = self.sort_and_select_parents(
+            self.current_population, self.fitness, self.n_parents
+        )
+
+        # Compute ranks and crowding distances INSIDE the parent pool
+        fronts, ranks = self.fast_nondominated_sort(parent_fitness)
+        crowding = np.zeros(len(parent_fitness))
         for front in fronts:
-            dist = self.compute_crowding_distance(self.fitness, front)
+            dist = self.compute_crowding_distance(parent_fitness, front)
             for i, idx in enumerate(front):
                 crowding[idx] = dist[i]
 
+        pool_size = len(parent_pool)
+        if pool_size < 4:
+            raise ValueError(
+                f"n_parents must be at least 4 for DE-style reproduction, got {pool_size}"
+            )
+
         for i in range(population_size):
-            # Select parent using tournament selection
+            # Select base parent from mating pool
             parent_idx = self.tournament_selection(ranks, crowding, tournament_size=2)
 
-            # Select 3 different individuals for differential evolution
-            r0 = parent_idx
-            while r0 == parent_idx:
-                r0 = np.random.randint(0, population_size)
-            r1 = r0
-            while r1 == r0 or r1 == parent_idx:
-                r1 = np.random.randint(0, population_size)
+            # Select 2 other distinct parents from the same mating pool
+            r1 = parent_idx
+            while r1 == parent_idx:
+                r1 = np.random.randint(0, pool_size)
+
             r2 = r1
-            while r2 == r1 or r2 == r0 or r2 == parent_idx:
-                r2 = np.random.randint(0, population_size)
+            while r2 == r1 or r2 == parent_idx:
+                r2 = np.random.randint(0, pool_size)
 
             jrand = np.random.randint(0, self.n_params)
             for j in range(self.n_params):
                 if np.random.random() <= self.crossover_prob or j == jrand:
                     new_offspring[i][j] = (
-                        self.current_population[parent_idx][j]
+                        parent_pool[parent_idx][j]
                         + self.mutation_prob
-                        * (self.current_population[r1][j] - self.current_population[r2][j])
+                        * (parent_pool[r1][j] - parent_pool[r2][j])
                     )
                 else:
-                    new_offspring[i][j] = self.current_population[parent_idx][j]
-        mutated_population = np.clip(new_offspring, self.min, self.max)
-        return mutated_population
+                    new_offspring[i][j] = parent_pool[parent_idx][j]
+
+        return np.clip(new_offspring, self.min, self.max)
 
     def sort_and_select_parents(
         self, population: np.ndarray, fitness: np.ndarray, n_parents: int

@@ -1,6 +1,9 @@
 import os
 
-os.environ.setdefault("MUJOCO_GL", "egl")
+# macOS-friendly; on Linux headless you may prefer "egl" or "osmesa"
+os.environ.setdefault("MUJOCO_GL", "glfw")
+import matplotlib
+matplotlib.use("Agg")
 
 from datetime import datetime
 from pathlib import Path
@@ -16,13 +19,235 @@ from evorob.world.ant_multi_world import AntMultiWorld
 from evorob.world.ant_world import AntFlatWorld
 from evorob.world.envs.ant_flat import AntFlatEnvironment
 from evorob.world.robot.controllers.mlp import NeuralNetworkController
-import matplotlib
-matplotlib.use('Agg')
 
 """
     Multi-objective optimisation: Ant two-terrains
 """
 
+
+# ---------------------------------------------------------------------------
+# Local hybrid controller definitions
+# ---------------------------------------------------------------------------
+
+class PhaseOscillatorController:
+    """
+    Per-joint phase oscillator used only to generate rhythmic phase features.
+
+    Output features:
+        [sin(phi_i), cos(phi_i)] for each joint i
+
+    Parameters per joint:
+        - frequency
+        - phase offset
+
+    Total params = 2 * output_size
+    """
+
+    def __init__(
+        self,
+        output_size: int = 8,
+        dt: float = 0.01,
+        default_frequency: float = 1.0,
+    ):
+        self.output_size = int(output_size)
+        self.dt = float(dt)
+        self.time_step = 0.0
+
+        self.frequencies = np.full(
+            self.output_size, default_frequency, dtype=np.float32
+        )
+        self.phases = np.zeros(self.output_size, dtype=np.float32)
+
+    def reset_controller(self, batch_size=1):
+        self.time_step = 0.0
+
+    def step_time(self):
+        self.time_step += self.dt
+
+    def get_phase(self):
+        return 2.0 * np.pi * self.frequencies * self.time_step + self.phases
+
+    def get_phase_features(self, state=None):
+        phase = self.get_phase()
+        sin_phase = np.sin(phase).astype(np.float32)
+        cos_phase = np.cos(phase).astype(np.float32)
+        feat = np.concatenate([sin_phase, cos_phase], axis=0)
+
+        if state is None:
+            return feat
+
+        x = np.asarray(state)
+        if x.ndim == 2:
+            return np.tile(feat[None, :], (x.shape[0], 1))
+
+        return feat
+
+    def get_action(self, state):
+        feat = self.get_phase_features(state)
+        self.step_time()
+        return feat
+
+    def set_weights(self, weights):
+        weights = np.asarray(weights, dtype=np.float32).ravel()
+        expected = 2 * self.output_size
+        if len(weights) != expected:
+            raise ValueError(f"Expected {expected} params, got {len(weights)}")
+
+        self.frequencies = weights[:self.output_size].copy().astype(np.float32)
+        self.phases = weights[self.output_size:].copy().astype(np.float32)
+        self.reset_controller()
+
+    def get_weights(self):
+        return np.concatenate([self.frequencies, self.phases]).astype(np.float32)
+
+    def get_num_params(self):
+        return 2 * self.output_size
+
+    def geno2pheno(self, genotype):
+        self.set_weights(genotype)
+
+
+class PhaseHybridResidualController:
+    """
+    Frozen base controller + trainable residual MLP + phase features.
+
+    Final action:
+        action = base_action + residual_scale * residual_action
+
+    Trainable params:
+        [residual_mlp_params | oscillator_params]
+    """
+
+    def __init__(
+        self,
+        base_controller,
+        residual_controller,
+        phase_controller,
+        residual_scale: float = 0.15,
+        action_dim: int = 8,
+    ):
+        self.base_controller = base_controller
+        self.residual_controller = residual_controller
+        self.phase_controller = phase_controller
+        self.residual_scale = float(residual_scale)
+        self.action_dim = int(action_dim)
+
+    def reset_controller(self, batch_size=1):
+        if hasattr(self.base_controller, "reset_controller"):
+            self.base_controller.reset_controller(batch_size=batch_size)
+
+        if hasattr(self.residual_controller, "reset_controller"):
+            self.residual_controller.reset_controller(batch_size=batch_size)
+
+        if hasattr(self.phase_controller, "reset_controller"):
+            self.phase_controller.reset_controller(batch_size=batch_size)
+
+    def _augment_state(self, state):
+        state = np.asarray(state, dtype=np.float32)
+        phase_feat = self.phase_controller.get_phase_features(state)
+
+        if state.ndim == 1:
+            return np.concatenate([state, phase_feat], axis=0)
+        elif state.ndim == 2:
+            return np.concatenate([state, phase_feat], axis=1)
+        else:
+            raise ValueError(f"Unsupported state shape: {state.shape}")
+
+    def get_action(self, state):
+        state = np.asarray(state, dtype=np.float32)
+
+        base_action = self.base_controller.get_action(state)
+        aug_state = self._augment_state(state)
+        residual_action = self.residual_controller.get_action(aug_state)
+
+        action = base_action + self.residual_scale * residual_action
+        action = np.clip(action, -1.0, 1.0)
+
+        self.phase_controller.step_time()
+        return action
+
+    def set_weights(self, weights):
+        weights = np.asarray(weights, dtype=np.float32).ravel()
+
+        n_res = self.residual_controller.get_num_params()
+        n_phase = self.phase_controller.get_num_params()
+        expected = n_res + n_phase
+
+        if len(weights) != expected:
+            raise ValueError(f"Expected {expected} params, got {len(weights)}")
+
+        self.residual_controller.set_weights(weights[:n_res])
+        self.phase_controller.set_weights(weights[n_res:n_res + n_phase])
+
+    def get_num_params(self):
+        return (
+            self.residual_controller.get_num_params()
+            + self.phase_controller.get_num_params()
+        )
+
+    def geno2pheno(self, genotype):
+        self.set_weights(genotype)
+
+    def get_phase_info(self):
+        return {
+            "frequencies": self.phase_controller.frequencies.copy(),
+            "phases": self.phase_controller.phases.copy(),
+        }
+
+class CompatibleHybridAntController(PhaseHybridResidualController):
+    BASE_HIDDEN = [256, 256]
+    RESIDUAL_HIDDEN = [16]
+    RESIDUAL_SCALE = 0.15
+    DT = 0.01
+    DEFAULT_FREQUENCY = 1.0
+
+    def __init__(self, input_size, output_size):
+        obs_dim = int(input_size)
+        action_dim = int(output_size)
+        phase_feat_dim = 2 * action_dim
+
+        base_controller = NeuralNetworkController(
+            input_size=obs_dim,
+            output_size=action_dim,
+            hidden_size=self.BASE_HIDDEN,
+        )
+
+        ppo_path = os.environ.get("/Users/farahelsousy/Desktop/evolutionary_robotics/micro-515-EvoRob/results/ppo_ckpts/ppo_ant_10000000_steps", "").strip()
+        if ppo_path and os.path.isfile(ppo_path):
+            try:
+                from stable_baselines3 import PPO
+                model = PPO.load(ppo_path, device="cpu")
+                base_controller.load_from_ppo_model(model)
+                print(f"[HybridController] Loaded PPO weights from: {ppo_path}")
+            except Exception as e:
+                print(
+                    f"[HybridController] Warning: failed to load PPO model from "
+                    f"'{ppo_path}'. Using random frozen base controller instead. Error: {e}"
+                )
+
+        residual_controller = NeuralNetworkController(
+            input_size=obs_dim + phase_feat_dim,
+            output_size=action_dim,
+            hidden_size=self.RESIDUAL_HIDDEN,
+        )
+
+        phase_controller = PhaseOscillatorController(
+            output_size=action_dim,
+            dt=self.DT,
+            default_frequency=self.DEFAULT_FREQUENCY,
+        )
+
+        super().__init__(
+            base_controller=base_controller,
+            residual_controller=residual_controller,
+            phase_controller=phase_controller,
+            residual_scale=self.RESIDUAL_SCALE,
+            action_dim=action_dim,
+        )
+
+        self.input_size = obs_dim
+        self.output_size = action_dim
+        self.n_params = self.get_num_params()
 
 def test_exercise_implementation():
     """Test NSGA-II implementation components."""
@@ -35,23 +260,19 @@ def test_exercise_implementation():
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
 
-        # Test case 1: Clear dominance
-        assert nsga.dominates([5, 3], [4, 2]) == True, (
+        assert nsga.dominates([5, 3], [4, 2]) is True, (
             "[5,3] should dominate [4,2] (better in both)"
         )
 
-        # Test case 2: No dominance (trade-off)
-        assert nsga.dominates([5, 2], [4, 3]) == False, (
+        assert nsga.dominates([5, 2], [4, 3]) is False, (
             "[5,2] should NOT dominate [4,3] (trade-off)"
         )
 
-        # Test case 3: Equal in one, better in other
-        assert nsga.dominates([5, 3], [5, 2]) == True, (
+        assert nsga.dominates([5, 3], [5, 2]) is True, (
             "[5,3] should dominate [5,2] (equal in first, better in second)"
         )
 
-        # Test case 4: Identical solutions
-        assert nsga.dominates([4, 3], [4, 3]) == False, (
+        assert nsga.dominates([4, 3], [4, 3]) is False, (
             "[4,3] should NOT dominate [4,3] (identical)"
         )
 
@@ -74,24 +295,19 @@ def test_exercise_implementation():
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
 
-        # Create test fitness with known Pareto structure
-        # Front 0: [5,5], [6,4], [4,6]  (non-dominated)
-        # Front 1: [5,3], [3,5]  (dominated by Front 0)
-        # Front 2: [3,3]  (dominated by Front 1)
         test_fitness = np.array(
             [
-                [5, 5],  # Front 0
-                [6, 4],  # Front 0
-                [4, 6],  # Front 0
-                [5, 3],  # Front 1
-                [3, 5],  # Front 1
-                [3, 3],  # Front 2
+                [5, 5],
+                [6, 4],
+                [4, 6],
+                [5, 3],
+                [3, 5],
+                [3, 3],
             ]
         )
 
         fronts, ranks = nsga.fast_nondominated_sort(test_fitness)
 
-        # Verify Front 0 contains non-dominated solutions
         assert len(fronts[0]) == 3, (
             f"Front 0 should have 3 solutions, got {len(fronts[0])}"
         )
@@ -99,7 +315,6 @@ def test_exercise_implementation():
             "Front 0 solutions should have rank 0"
         )
 
-        # Verify Front 1
         assert len(fronts[1]) == 2, (
             f"Front 1 should have 2 solutions, got {len(fronts[1])}"
         )
@@ -107,7 +322,6 @@ def test_exercise_implementation():
             "Front 1 solutions should have rank 1"
         )
 
-        # Verify Front 2
         assert len(fronts[2]) == 1, (
             f"Front 2 should have 1 solution, got {len(fronts[2])}"
         )
@@ -131,18 +345,14 @@ def test_exercise_implementation():
         print(f"❌ Error: {type(e).__name__}: {str(e)}")
         exit(1)
 
-    # Optional tests for enhanced diversity (crowding distance)
     print("\n" + "-" * 60)
     print("Testing Enhanced Diversity (Crowding Distance)")
     print("-" * 60)
 
-    # Test 3: Crowding Distance (OPTIONAL)
     print("\n[3/5] Testing Crowding Distance...")
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
 
-        # Create a simple front with known distances
-        # Points: [1,1], [2,2], [3,3], [4,4], [5,5] (diagonal line)
         test_fitness = np.array(
             [
                 [1, 1],
@@ -152,15 +362,13 @@ def test_exercise_implementation():
                 [5, 5],
             ]
         )
-        front_indices = [0, 1, 2, 3, 4]  # All in same front
+        front_indices = [0, 1, 2, 3, 4]
 
         distances = nsga.compute_crowding_distance(test_fitness, front_indices)
 
-        # Boundary solutions should have infinite distance
         assert distances[0] == np.inf, "First solution should have infinite distance"
         assert distances[4] == np.inf, "Last solution should have infinite distance"
 
-        # Interior solutions should have finite positive distance
         assert distances[1] > 0 and np.isfinite(distances[1]), (
             "Interior solution should have finite positive distance"
         )
@@ -185,7 +393,6 @@ def test_exercise_implementation():
     except Exception as e:
         print(f"⚠️  Error: {type(e).__name__}: {str(e)}")
 
-    # Test 4: Crowding Operator (OPTIONAL)
     print("\n[4/5] Testing Crowding Operator...")
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
@@ -193,11 +400,9 @@ def test_exercise_implementation():
         ranks = [0, 0, 1, 1]
         crowding_dists = np.array([2.0, 3.0, 5.0, 1.0])
 
-        # Test rank preference (lower rank wins)
         winner = nsga.crowding_operator(0, 2, ranks, crowding_dists)
         assert winner == 0, "Individual with rank 0 should beat rank 1"
 
-        # Test crowding distance preference (same rank)
         winner = nsga.crowding_operator(0, 1, ranks, crowding_dists)
         assert winner == 1, "Individual with crowding distance 3.0 should beat 2.0"
 
@@ -213,17 +418,14 @@ def test_exercise_implementation():
     except Exception as e:
         print(f"⚠️  Error: {type(e).__name__}: {str(e)}")
 
-    # Test 5: Enhanced Parent Selection (OPTIONAL)
     print("\n[5/5] Testing Enhanced Parent Selection...")
 
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5, n_parents=5)
 
-        # Create a small population
         test_population = np.random.uniform(-1, 1, (10, 5))
         test_fitness = np.random.uniform(0, 10, (10, 2))
 
-        # Select parents - this works with or without crowding distance
         parents, parent_fitness = nsga.sort_and_select_parents(
             test_population, test_fitness, n_parents=5
         )
@@ -255,12 +457,11 @@ def test_exercise_implementation():
 
 def inspect_ant_multi_world():
     """Test the AntMultiWorld environment."""
-    world = AntMultiWorld(controller_cls=NeuralNetworkController)
+    world = AntMultiWorld(controller_cls=CompatibleHybridAntController)
     print(f"Observation space: {world.obs_size}")
     print(f"Action space: {world.action_size}")
     print(f"Controller parameters: {world.n_params}")
 
-    # Test evaluation of a random individual
     random_genotype = np.random.uniform(-1, 1, world.n_params)
     fitness = world.evaluate_individual(random_genotype)
     print(f"Fitness of random individual: {fitness}")
@@ -272,7 +473,7 @@ def inspect_ant_multi_world():
 
 def plot_fitness(full_f, output_dir):
     """Save a fitness-over-generations plot for both objectives."""
-    fitness_array = np.array(full_f)  # (n_generations, n_pop, 2)
+    fitness_array = np.array(full_f)
     generations = np.arange(1, len(fitness_array) + 1)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -314,21 +515,13 @@ def plot_fitness(full_f, output_dir):
 
 
 def plot_pareto_fronts(fitness, output_dir, num_generations=None, population_size=None):
-    """Plot Pareto fronts for a 2-objective fitness array.
-
-    Args:
-        fitness:         (n_pop, 2) fitness array for one generation.
-        output_dir:      Directory to save the plot.
-        num_generations: Number of generations (for title). Optional.
-        population_size: Population size (for title). Optional.
-    """
+    """Plot Pareto fronts for a 2-objective fitness array."""
     dummy_nsga = NSGAII(population_size=fitness.shape[0], n_opt_params=1)
     fronts, _ = dummy_nsga.fast_nondominated_sort(fitness)
 
     fig, ax = plt.subplots(figsize=(9, 6))
     n_fronts = len(fronts)
 
-    # Top 3 fronts: distinct colors, connected by sorted lines
     top_colors = ["#B51F1F", "#007480", "#4B0082"]
     n_top = min(3, n_fronts)
     for i in range(n_top):
@@ -349,7 +542,6 @@ def plot_pareto_fronts(fitness, output_dir, num_generations=None, population_siz
             zorder=4,
         )
 
-    # Remaining fronts: colormap
     if n_fronts > 3:
         remaining_cmap = plt.cm.coolwarm
         for i in range(3, n_fronts):
@@ -392,7 +584,6 @@ def plot_pareto_fronts_from_checkpoint(checkpoint_dir: str):
         print(f"Could not load fitness data from {fitness_path}: {e}")
         return
 
-    # shape is (generations, pop, 2) — use last generation
     fitness = all_fitness[-1] if all_fitness.ndim == 3 else all_fitness
     plot_pareto_fronts(fitness, checkpoint_dir)
 
@@ -460,20 +651,11 @@ def evaluate_checkpoint(
     checkpoint_dir: str,
     output_dir: str = "evaluation_output",
 ):
-    """Evaluate a checkpoint on both custom environments (flat + ice terrain).
+    """Evaluate a checkpoint on both custom environments (flat + ice terrain)."""
+    n_episodes: int = 256
+    max_episode_steps: int = 1000
+    seed: int = 0
 
-    Loads the best genotype from the checkpoint, runs it for multiple episodes
-    on each terrain, writes a score file and records one video per terrain.
-
-    Args:
-        checkpoint_dir: Path to your NSGA-II checkpoint folder
-        output_dir:     Where to save score file and videos
-    """
-    n_episodes: int = 256  # DO NOT CHANGE!
-    max_episode_steps: int = 1000  # DO NOT CHANGE!
-    seed: int = 0  # DO NOT CHANGE!
-
-    # --- Load best genotype from checkpoint ---
     last_gen = get_last_checkpoint_dir(checkpoint_dir)
     x_best_path = os.path.join(last_gen, "x_best.npy") if last_gen else ""
 
@@ -488,10 +670,11 @@ def evaluate_checkpoint(
     genotype = np.load(x_best_path)
     print(f"Loaded genotype from: {x_best_path}  (shape: {genotype.shape})")
 
-    controller = NeuralNetworkController(input_size=27, output_size=8, hidden_size=16)
-    print(f"Controller: NeuralNetworkController  |  Parameters: {controller.n_params}\n")
+    controller = controller = CompatibleHybridAntController(input_size=27, output_size=8)
+    print(
+        f"Controller: CompatibleHybridAntController  |  Parameters: {controller.n_params}\n"
+    )
 
-    # --- Evaluate on both environments ---
     terrains = {
         "flat": "ant_flat_terrain.xml",
         "ice": "ant_ice_terrain.xml",
@@ -520,7 +703,6 @@ def evaluate_checkpoint(
             f"best={r['best']:.2f}  worst={r['worst']:.2f}"
         )
 
-    # --- Record one video per terrain ---
     os.makedirs(output_dir, exist_ok=True)
     for terrain_name, robot_path in terrains.items():
         video_path = os.path.join(output_dir, f"evaluation_{terrain_name}.mp4")
@@ -529,17 +711,15 @@ def evaluate_checkpoint(
             max_episode_steps, seed, video_path,
         )
 
-    # --- Save score file with summary ---
     score_path = os.path.join(output_dir, "evaluation_score.txt")
     with open(score_path, "w") as f:
         f.write("=" * 50 + "\n")
         f.write("MICRO-515 Challenge 2 - Evaluation Results\n")
         f.write("=" * 50 + "\n\n")
-        f.write(f"Controller type : NeuralNetworkController\n")
+        f.write("Controller type : CompatibleHybridAntController\n")
         f.write(f"Checkpoint      : {checkpoint_dir}\n")
         f.write(f"Episodes/terrain: {n_episodes}\n\n")
 
-        # Summary table
         f.write("=" * 60 + "\n")
         f.write("SUMMARY\n")
         f.write("=" * 60 + "\n")
@@ -553,7 +733,6 @@ def evaluate_checkpoint(
             )
         f.write("\n")
 
-        # Per-episode details
         for terrain_name in terrains:
             r = results[terrain_name]
             f.write("-" * 50 + "\n")
@@ -593,10 +772,11 @@ def run_evolution_nsga(
     """Run NSGA-II multi-objective evolutionary optimization."""
     np.random.seed(random_seed)
 
-    # Create world for evaluation
-    world = AntMultiWorld(controller_cls=NeuralNetworkController, n_repeats=n_repeats)
+    world = AntMultiWorld(
+        controller_cls=CompatibleHybridAntController,
+        n_repeats=n_repeats,
+    )
 
-    # Setup checkpoint directory
     dt_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     if checkpoint_path is None:
         checkpoint_path = f"results/{dt_str}_nsga_ckpts"
@@ -608,7 +788,6 @@ def run_evolution_nsga(
     ckpt_dir = Path(checkpoint_path)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # NSGA-II hyperparameters
     nsga_kwargs = dict(
         population_size=population_size,
         n_opt_params=world.n_params,
@@ -619,7 +798,6 @@ def run_evolution_nsga(
     )
     nsga = NSGAII(**nsga_kwargs, output_dir=ckpt_dir)
 
-    # Save metadata before training
     metadata_path = ckpt_dir / "metadata.txt"
     with open(metadata_path, "w") as f:
         f.write("=" * 60 + "\n")
@@ -641,7 +819,6 @@ def run_evolution_nsga(
         f.write("\n")
     print(f"Metadata saved to: {metadata_path}")
 
-    # Print training header
     print("\n" + "=" * 70)
     print(f"{'MULTI-OBJECTIVE EVOLUTION - NSGA-II':^70}")
     print("=" * 70)
@@ -652,7 +829,6 @@ def run_evolution_nsga(
     print(f"Objective 1: Flat Terrain Speed | Objective 2: Ice Terrain Speed")
     print("=" * 70 + "\n")
 
-    # Evolution loop
     for generation in range(num_generations):
         population = nsga.ask()
         multi_fitness = np.empty((len(population), 2))
@@ -665,7 +841,6 @@ def run_evolution_nsga(
         )
         nsga.tell(population, multi_fitness, save_checkpoint=save_checkpoint)
 
-        # Logging
         mean_obj1 = np.mean(multi_fitness[:, 0])
         mean_obj2 = np.mean(multi_fitness[:, 1])
         best_obj1 = np.max(multi_fitness[:, 0])
@@ -687,12 +862,8 @@ def run_evolution_nsga(
         )
         print()
 
-    # --- Post-training outputs ---
-
-    # Fitness plot
     plot_fitness(nsga.full_f, ckpt_dir)
 
-    # Pareto front plot
     final_fitness = np.array(nsga.full_f)[-1]
     plot_pareto_fronts(
         final_fitness, ckpt_dir,
@@ -700,7 +871,6 @@ def run_evolution_nsga(
         population_size=population_size,
     )
 
-    # Evaluation on both terrains
     eval_results = None
     if compute_score:
         try:
@@ -711,9 +881,6 @@ def run_evolution_nsga(
         except Exception as e:
             print(f"Warning: Evaluation failed: {e}")
 
-    # Interactive evaluation
-    # This only works, when run on a local machine with display capabilities and rendering support.
-    # If running in a headless environment (e.g. SCITAS cluster), this will be skipped with a warning.
     if run_evaluation:
         best_population = nsga.x
         best_fitness = nsga.f
@@ -758,8 +925,12 @@ def replay_checkpoint(checkpoint_path: str):
     """Re-evaluate a checkpoint and generate videos."""
     np.random.seed(31)
 
-    population = np.load(f"{checkpoint_path}/x.npy")
-    world = AntMultiWorld(controller_cls=NeuralNetworkController)
+    x_path = os.path.join(checkpoint_path, "x.npy")
+    if not os.path.exists(x_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {x_path}")
+
+    population = np.load(x_path)
+    world = AntMultiWorld(controller_cls=CompatibleHybridAntController)
 
     multi_fitness = np.empty((len(population), 2))
     for i, individual in enumerate(population):
@@ -782,10 +953,11 @@ def replay_checkpoint(checkpoint_path: str):
     plt.ylabel("Fitness Objective 2")
     plt.title("Multi-Objective Fitness Scatter Plot")
     plt.savefig("fitness_scatter.png")
+    plt.close()
 
     n_evals = 5
     for idx_eval in range(n_evals):
-        ant_ice_world = AntFlatWorld()
+        ant_ice_world = AntFlatWorld(controller_cls=CompatibleHybridAntController)
         ant_ice_world.generate_best_individual_video(
             env=ant_ice_world.create_env(
                 robot_path="ant_ice_terrain.xml", width=800, height=608
@@ -794,7 +966,7 @@ def replay_checkpoint(checkpoint_path: str):
             controller=ant_ice_world.geno2pheno(population[best_ice_idx]),
         )
 
-        ant_flat_world = AntFlatWorld()
+        ant_flat_world = AntFlatWorld(controller_cls=CompatibleHybridAntController)
         ant_flat_world.generate_best_individual_video(
             env=ant_flat_world.create_env(
                 robot_path="ant_flat_terrain.xml", width=800, height=608
@@ -806,23 +978,19 @@ def replay_checkpoint(checkpoint_path: str):
 
 
 if __name__ == "__main__":
-    # Run unit tests first
     test_exercise_implementation()
-
-    # Uncomment to run full NSGA-II evolution:
     run_evolution_nsga(
-        num_generations=2,
-        population_size=10,
-        run_evaluation=False,
-        compute_score=True,
-        random_seed=42,
-        n_repeats=2,
-        mutation_prob=0.3,
-        crossover_prob=0.5,
-        bounds=(-1, 1),
-        n_parents=10,
-        ckpt_interval=5,
-        checkpoint_path=None,
+    num_generations=100,
+    population_size=100,
+    n_parents=50,       # 50% selection pressure is the standard for NSGA-II
+    n_repeats=6,        # Enough to average out the slippery ice variance
+    mutation_prob=0.05, # Low mutation preserves the PPO gait
+    crossover_prob=0.5, # Balanced crossover for diversity
+    bounds=(-0.1, 0.1), # Keeps residuals from breaking the robot
+    ckpt_interval=20,
+    compute_score=True,
+    random_seed=42,
+    run_evaluation=False, # Set to True to run the interactive evaluation after training
     )
 """
     # Uncomment to replay your checkpoint
