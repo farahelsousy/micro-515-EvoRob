@@ -4,13 +4,16 @@ from evorob.world.robot.controllers.base import Controller
 
 class PhaseHybridResidualController(Controller):
     """
-    Frozen PPO + trainable residual MLP + phase features.
+    Frozen PPO + trainable residual MLP + fixed phase features.
 
     Final action:
         action = ppo_action + residual_scale * residual_action
 
     Trainable params:
-        [residual_mlp_params | oscillator_params]
+        [residual_mlp_params]
+
+    The phase oscillator is kept FIXED and is used only to generate
+    rhythmic phase features for the residual controller.
     """
 
     def __init__(
@@ -18,7 +21,7 @@ class PhaseHybridResidualController(Controller):
         ppo_controller,
         residual_controller,
         phase_controller,
-        residual_scale: float = 0.15,
+        residual_scale: float = 0.10,
         action_dim: int = 8,
     ):
         self.ppo_controller = ppo_controller
@@ -62,23 +65,24 @@ class PhaseHybridResidualController(Controller):
         return action
 
     def set_weights(self, weights):
+        """
+        Residual-only training:
+        genotype contains ONLY the residual MLP parameters.
+        """
         weights = np.asarray(weights, dtype=np.float32).ravel()
 
         n_res = self.residual_controller.get_num_params()
-        n_phase = self.phase_controller.get_num_params()
-        expected = n_res + n_phase
+        if len(weights) != n_res:
+            raise ValueError(f"Expected {n_res} params, got {len(weights)}")
 
-        if len(weights) != expected:
-            raise ValueError(f"Expected {expected} params, got {len(weights)}")
-
-        self.residual_controller.set_weights(weights[:n_res])
-        self.phase_controller.set_weights(weights[n_res:n_res + n_phase])
+        self.residual_controller.set_weights(weights)
 
     def get_num_params(self):
-        return (
-            self.residual_controller.get_num_params()
-            + self.phase_controller.get_num_params()
-        )
+        """
+        Residual-only training:
+        only the residual MLP contributes trainable params.
+        """
+        return self.residual_controller.get_num_params()
 
     def geno2pheno(self, genotype):
         self.set_weights(genotype)

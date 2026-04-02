@@ -22,197 +22,34 @@ from evorob.world.robot.controllers.mlp import NeuralNetworkController
 
 """
     Multi-objective optimisation: Ant two-terrains
+    PPO-only baseline inside the SAME NSGA-II pipeline
 """
 
 
 # ---------------------------------------------------------------------------
-# Local hybrid controller definitions
+# PPO-only controller
 # ---------------------------------------------------------------------------
 
-class PhaseOscillatorController:
+class PPOOnlyAntController:
     """
-    Per-joint phase oscillator used only to generate rhythmic phase features.
+    Frozen PPO-only controller.
 
-    Output features:
-        [sin(phi_i), cos(phi_i)] for each joint i
+    Keeps the same style as your current CompatibleHybridAntController:
+    - build a NeuralNetworkController
+    - load PPO weights into it with load_from_ppo_model()
 
-    Parameters per joint:
-        - frequency
-        - phase offset
+    No residual, no oscillator, no trainable control parameters.
 
-    Total params = 2 * output_size
-    """
-
-    def __init__(
-        self,
-        output_size: int = 8,
-        dt: float = 0.01,
-        default_frequency: float = 1.0,
-    ):
-        self.output_size = int(output_size)
-        self.dt = float(dt)
-        self.time_step = 0.0
-
-        self.frequencies = np.full(
-            self.output_size, default_frequency, dtype=np.float32
-        )
-        self.phases = np.zeros(self.output_size, dtype=np.float32)
-
-    def reset_controller(self, batch_size=1):
-        self.time_step = 0.0
-
-    def step_time(self):
-        self.time_step += self.dt
-
-    def get_phase(self):
-        return 2.0 * np.pi * self.frequencies * self.time_step + self.phases
-
-    def get_phase_features(self, state=None):
-        phase = self.get_phase()
-        sin_phase = np.sin(phase).astype(np.float32)
-        cos_phase = np.cos(phase).astype(np.float32)
-        feat = np.concatenate([sin_phase, cos_phase], axis=0)
-
-        if state is None:
-            return feat
-
-        x = np.asarray(state)
-        if x.ndim == 2:
-            return np.tile(feat[None, :], (x.shape[0], 1))
-
-        return feat
-
-    def get_action(self, state):
-        feat = self.get_phase_features(state)
-        self.step_time()
-        return feat
-
-    def set_weights(self, weights):
-        weights = np.asarray(weights, dtype=np.float32).ravel()
-        expected = 2 * self.output_size
-        if len(weights) != expected:
-            raise ValueError(f"Expected {expected} params, got {len(weights)}")
-
-        self.frequencies = weights[:self.output_size].copy().astype(np.float32)
-        self.phases = weights[self.output_size:].copy().astype(np.float32)
-        self.reset_controller()
-
-    def get_weights(self):
-        return np.concatenate([self.frequencies, self.phases]).astype(np.float32)
-
-    def get_num_params(self):
-        return 2 * self.output_size
-
-    def geno2pheno(self, genotype):
-        self.set_weights(genotype)
-
-
-class PhaseHybridResidualController:
-    """
-    Frozen base controller + trainable residual MLP + phase features.
-
-    Final action:
-        action = base_action + residual_scale * residual_action
-
-    Trainable params:
-        [residual_mlp_params | oscillator_params]
+    To keep the NSGA-II pipeline unchanged, we expose 1 dummy parameter
+    that is ignored completely.
     """
 
-    def __init__(
-        self,
-        base_controller,
-        residual_controller,
-        phase_controller,
-        residual_scale: float = 0.15,
-        action_dim: int = 8,
-    ):
-        self.base_controller = base_controller
-        self.residual_controller = residual_controller
-        self.phase_controller = phase_controller
-        self.residual_scale = float(residual_scale)
-        self.action_dim = int(action_dim)
-
-    def reset_controller(self, batch_size=1):
-        if hasattr(self.base_controller, "reset_controller"):
-            self.base_controller.reset_controller(batch_size=batch_size)
-
-        if hasattr(self.residual_controller, "reset_controller"):
-            self.residual_controller.reset_controller(batch_size=batch_size)
-
-        if hasattr(self.phase_controller, "reset_controller"):
-            self.phase_controller.reset_controller(batch_size=batch_size)
-
-    def _augment_state(self, state):
-        state = np.asarray(state, dtype=np.float32)
-        phase_feat = self.phase_controller.get_phase_features(state)
-
-        if state.ndim == 1:
-            return np.concatenate([state, phase_feat], axis=0)
-        elif state.ndim == 2:
-            return np.concatenate([state, phase_feat], axis=1)
-        else:
-            raise ValueError(f"Unsupported state shape: {state.shape}")
-
-    def get_action(self, state):
-        state = np.asarray(state, dtype=np.float32)
-
-        base_action = self.base_controller.get_action(state)
-        aug_state = self._augment_state(state)
-        residual_action = self.residual_controller.get_action(aug_state)
-
-        action = base_action + self.residual_scale * residual_action
-        action = np.clip(action, -1.0, 1.0)
-
-        self.phase_controller.step_time()
-        return action
-
-    def set_weights(self, weights):
-        weights = np.asarray(weights, dtype=np.float32).ravel()
-
-        n_res = self.residual_controller.get_num_params()
-        n_phase = self.phase_controller.get_num_params()
-        expected = n_res + n_phase
-
-        if len(weights) != expected:
-            raise ValueError(f"Expected {expected} params, got {len(weights)}")
-
-        self.residual_controller.set_weights(weights[:n_res])
-        self.phase_controller.set_weights(weights[n_res:n_res + n_phase])
-
-    def get_num_params(self):
-        return (
-            self.residual_controller.get_num_params()
-            + self.phase_controller.get_num_params()
-        )
-
-    def geno2pheno(self, genotype):
-        self.set_weights(genotype)
-
-    def get_phase_info(self):
-        return {
-            "frequencies": self.phase_controller.frequencies.copy(),
-            "phases": self.phase_controller.phases.copy(),
-        }
-
-class CompatibleHybridAntController(PhaseHybridResidualController):
     BASE_HIDDEN = [256, 256]
-    RESIDUAL_HIDDEN = [16]
-    RESIDUAL_SCALE = 0.15
-    DT = 0.01
-    DEFAULT_FREQUENCY = 1.0
-
     PPO_PATH = "results/ppo_ckpts/ppo_ant_10000000_steps.zip"
-
-    # Full OLD hybrid genotype from your earlier trained controller
-    OLD_HYBRID_GENOTYPE_PATH = (
-        "/Users/farahelsousy/Desktop/evolutionary_robotics/"
-        "micro-515-EvoRob/results/20260319_101259_phase_hybrid_residual_ckpts_best_sofar ice/80/x_best.npy"
-    )
 
     def __init__(self, input_size, output_size):
         obs_dim = int(input_size)
         action_dim = int(output_size)
-        phase_feat_dim = 2 * action_dim
 
         # --------------------------------------------------
         # Frozen PPO base controller
@@ -228,130 +65,64 @@ class CompatibleHybridAntController(PhaseHybridResidualController):
                 from stable_baselines3 import PPO
                 model = PPO.load(self.PPO_PATH, device="cpu")
                 base_controller.load_from_ppo_model(model)
-                print(f"[HybridController] Loaded PPO weights from: {self.PPO_PATH}")
+                print(f"[PPOOnlyController] Loaded PPO weights from: {self.PPO_PATH}")
             except Exception as e:
                 print(
-                    f"[HybridController] Warning: failed to load PPO model from "
+                    f"[PPOOnlyController] Warning: failed to load PPO model from "
                     f"'{self.PPO_PATH}'. Using random frozen base controller instead. "
                     f"Error: {e}"
                 )
         else:
             print(
-                f"[HybridController] Warning: PPO checkpoint not found at "
+                f"[PPOOnlyController] Warning: PPO checkpoint not found at "
                 f"'{self.PPO_PATH}'. Using random frozen base controller instead."
             )
 
-        # --------------------------------------------------
-        # Residual controller
-        # --------------------------------------------------
-        residual_controller = NeuralNetworkController(
-            input_size=obs_dim + phase_feat_dim,
-            output_size=action_dim,
-            hidden_size=self.RESIDUAL_HIDDEN,
-        )
-
-        # start from zeros unless replaced by old genotype below
-        residual_zero = np.zeros(residual_controller.get_num_params(), dtype=np.float32)
-        residual_controller.set_weights(residual_zero)
-
-        # --------------------------------------------------
-        # Phase oscillator
-        # --------------------------------------------------
-        phase_controller = PhaseOscillatorController(
-            output_size=action_dim,
-            dt=self.DT,
-            default_frequency=self.DEFAULT_FREQUENCY,
-        )
-
-        # --------------------------------------------------
-        # Build hybrid controller
-        # --------------------------------------------------
-        super().__init__(
-            base_controller=base_controller,
-            residual_controller=residual_controller,
-            phase_controller=phase_controller,
-            residual_scale=self.RESIDUAL_SCALE,
-            action_dim=action_dim,
-        )
-
-        # --------------------------------------------------
-        # Load old hybrid genotype ONCE, like video.py
-        # and split it into residual + phase parts
-        # --------------------------------------------------
-        self._fixed_phase_weights = None
-
-        if os.path.isfile(self.OLD_HYBRID_GENOTYPE_PATH):
-            try:
-                old_genotype = np.load(self.OLD_HYBRID_GENOTYPE_PATH).astype(np.float32).ravel()
-
-                n_res = self.residual_controller.get_num_params()
-                n_phase = self.phase_controller.get_num_params()
-                expected = n_res + n_phase
-
-                if old_genotype.shape[0] != expected:
-                    raise ValueError(
-                        f"Old hybrid genotype size mismatch: expected {expected}, "
-                        f"got {old_genotype.shape[0]}"
-                    )
-
-                old_residual = old_genotype[:n_res]
-                old_phase = old_genotype[n_res:n_res + n_phase]
-
-                # initialize residual from old trained residual
-                self.residual_controller.set_weights(old_residual)
-
-                # initialize and freeze oscillator from old trained oscillator
-                self.phase_controller.set_weights(old_phase)
-                self._fixed_phase_weights = old_phase.copy()
-
-                print(
-                    f"[HybridController] Loaded old hybrid genotype from: "
-                    f"{self.OLD_HYBRID_GENOTYPE_PATH}"
-                )
-
-            except Exception as e:
-                print(
-                    "[HybridController] Warning: failed to load old hybrid genotype. "
-                    f"Using zero residual + default oscillator. Error: {e}"
-                )
-                self._fixed_phase_weights = self.phase_controller.get_weights().copy()
-        else:
-            print(
-                "[HybridController] Warning: old hybrid genotype not found at "
-                f"'{self.OLD_HYBRID_GENOTYPE_PATH}'. Using default oscillator."
-            )
-            self._fixed_phase_weights = self.phase_controller.get_weights().copy()
-
+        self.base_controller = base_controller
         self.input_size = obs_dim
         self.output_size = action_dim
-        self.n_params = self.get_num_params()
+
+        # Keep 1 dummy parameter so NSGA-II code stays unchanged.
+        # This parameter has NO effect.
+        self.n_params = 1
+
+    def reset_controller(self, batch_size=1):
+        if hasattr(self.base_controller, "reset_controller"):
+            self.base_controller.reset_controller(batch_size=batch_size)
+
+    def get_action(self, state):
+        state = np.asarray(state, dtype=np.float32)
+        action = self.base_controller.get_action(state)
+        action = np.asarray(action, dtype=np.float32)
+        action = np.clip(action, -1.0, 1.0)
+        return action
 
     def set_weights(self, weights):
         """
-        Residual-only evolution:
-        - update ONLY residual params from genotype
-        - keep oscillator fixed to old trained phase weights
+        Ignore genotype completely.
+        We only keep this for compatibility with AntMultiWorld / NSGA-II.
         """
+        if weights is None:
+            return
+
         weights = np.asarray(weights, dtype=np.float32).ravel()
+        if len(weights) != self.n_params:
+            raise ValueError(
+                f"[PPOOnlyController] Expected {self.n_params} dummy param, "
+                f"got {len(weights)}"
+            )
 
-        n_res = self.residual_controller.get_num_params()
-        if len(weights) != n_res:
-            raise ValueError(f"Expected {n_res} params, got {len(weights)}")
-
-        self.residual_controller.set_weights(weights)
-
-        # keep oscillator frozen
-        if self._fixed_phase_weights is not None:
-            self.phase_controller.set_weights(self._fixed_phase_weights)
+        # Intentionally ignored
 
     def get_num_params(self):
-        """
-        Only residual parameters are trainable now.
-        """
-        return self.residual_controller.get_num_params()
+        return self.n_params
 
     def geno2pheno(self, genotype):
         self.set_weights(genotype)
+
+    def get_phase_info(self):
+        return {}
+
 
 def test_exercise_implementation():
     """Test NSGA-II implementation components."""
@@ -561,7 +332,7 @@ def test_exercise_implementation():
 
 def inspect_ant_multi_world():
     """Test the AntMultiWorld environment."""
-    world = AntMultiWorld(controller_cls=CompatibleHybridAntController)
+    world = AntMultiWorld(controller_cls=PPOOnlyAntController)
     print(f"Observation space: {world.obs_size}")
     print(f"Action space: {world.action_size}")
     print(f"Controller parameters: {world.n_params}")
@@ -774,9 +545,9 @@ def evaluate_checkpoint(
     genotype = np.load(x_best_path)
     print(f"Loaded genotype from: {x_best_path}  (shape: {genotype.shape})")
 
-    controller = controller = CompatibleHybridAntController(input_size=27, output_size=8)
+    controller = PPOOnlyAntController(input_size=27, output_size=8)
     print(
-        f"Controller: CompatibleHybridAntController  |  Parameters: {controller.n_params}\n"
+        f"Controller: PPOOnlyAntController  |  Parameters: {controller.n_params}\n"
     )
 
     terrains = {
@@ -820,7 +591,7 @@ def evaluate_checkpoint(
         f.write("=" * 50 + "\n")
         f.write("MICRO-515 Challenge 2 - Evaluation Results\n")
         f.write("=" * 50 + "\n\n")
-        f.write("Controller type : CompatibleHybridAntController\n")
+        f.write("Controller type : PPOOnlyAntController\n")
         f.write(f"Checkpoint      : {checkpoint_dir}\n")
         f.write(f"Episodes/terrain: {n_episodes}\n\n")
 
@@ -877,7 +648,7 @@ def run_evolution_nsga(
     np.random.seed(random_seed)
 
     world = AntMultiWorld(
-        controller_cls=CompatibleHybridAntController,
+        controller_cls=PPOOnlyAntController,
         n_repeats=n_repeats,
     )
 
@@ -1034,7 +805,7 @@ def replay_checkpoint(checkpoint_path: str):
         raise FileNotFoundError(f"Checkpoint file not found: {x_path}")
 
     population = np.load(x_path)
-    world = AntMultiWorld(controller_cls=CompatibleHybridAntController)
+    world = AntMultiWorld(controller_cls=PPOOnlyAntController)
 
     multi_fitness = np.empty((len(population), 2))
     for i, individual in enumerate(population):
@@ -1061,7 +832,7 @@ def replay_checkpoint(checkpoint_path: str):
 
     n_evals = 5
     for idx_eval in range(n_evals):
-        ant_ice_world = AntFlatWorld(controller_cls=CompatibleHybridAntController)
+        ant_ice_world = AntFlatWorld(controller_cls=PPOOnlyAntController)
         ant_ice_world.generate_best_individual_video(
             env=ant_ice_world.create_env(
                 robot_path="ant_ice_terrain.xml", width=800, height=608
@@ -1070,7 +841,7 @@ def replay_checkpoint(checkpoint_path: str):
             controller=ant_ice_world.geno2pheno(population[best_ice_idx]),
         )
 
-        ant_flat_world = AntFlatWorld(controller_cls=CompatibleHybridAntController)
+        ant_flat_world = AntFlatWorld(controller_cls=PPOOnlyAntController)
         ant_flat_world.generate_best_individual_video(
             env=ant_flat_world.create_env(
                 robot_path="ant_flat_terrain.xml", width=800, height=608
@@ -1085,7 +856,7 @@ if __name__ == "__main__":
     test_exercise_implementation()
     run_evolution_nsga(
         num_generations=5,
-        population_size=120,
+        population_size=5,
         n_parents=50,
         n_repeats=6,
         mutation_prob=0.02,
@@ -1096,7 +867,7 @@ if __name__ == "__main__":
         random_seed=42,
         ckpt_interval=20,
     )
-    
+
 """
     # Uncomment to replay your checkpoint
     replay_checkpoint(
