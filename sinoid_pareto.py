@@ -1,60 +1,84 @@
 import os
 import json
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import imageio
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 from evorob.algorithms.nsga import NSGAII
 from evorob.utils.filesys import get_last_checkpoint_dir
-from evorob.world.ant_multi_world import AntMultiWorld
-from evorob.world.ant_world import AntFlatWorld
 from evorob.world.envs.ant_flat import AntFlatEnvironment
-from evorob.world.robot.controllers.mlp import NeuralNetworkController
-
-from Challenge2 import CompatibleHybridAntController
-# ---------------------------------------------------------------------------
-# YOUR EXISTING CONTROLLER(S)
-# Keep your own controller definitions here
-# Example below assumes CompatibleHybridAntController already exists above.
-# ---------------------------------------------------------------------------
+from evorob.world.robot.controllers.sinoid import OscillatoryController
 
 
 # ---------------------------------------------------------------------------
-# Utility: load final population / fitness from checkpoint
+# Compatibility wrapper
+# ---------------------------------------------------------------------------
+
+class CompatibleOscillatoryAntController:
+    """
+    Thin compatibility wrapper so evaluation code can use the same interface
+    as the other controllers.
+    """
+
+    def __init__(self, input_size=None, output_size=8):
+        del input_size
+        self.output_size = int(output_size)
+        self.controller = OscillatoryController(output_size=self.output_size)
+        self.n_params = self.controller.get_num_params()
+
+    def get_action(self, state):
+        return self.controller.get_action(state)
+
+    def set_weights(self, weights):
+        self.controller.set_weights(weights)
+
+    def get_num_params(self):
+        return self.controller.get_num_params()
+
+    def geno2pheno(self, genotype):
+        self.controller.geno2pheno(genotype)
+
+    def reset_controller(self, batch_size=1):
+        if hasattr(self.controller, "reset_controller"):
+            self.controller.reset_controller(batch_size=batch_size)
+        elif hasattr(self.controller, "reset_model"):
+            self.controller.reset_model()
+
+
+# ---------------------------------------------------------------------------
+# Load final population / fitness
 # ---------------------------------------------------------------------------
 
 def load_final_population_and_fitness(checkpoint_dir: str):
     """
-    Try to load final population and fitness from a checkpoint directory.
+    Load final population and fitness from an NSGA-II checkpoint directory.
 
-    Supported patterns:
+    Supported:
+    - full_x.npy + full_f.npy -> uses last generation
     - x.npy + f.npy
-    - full_x.npy + full_f.npy (takes last generation)
+    - fallback to last generation subfolder
     """
-    x_path = os.path.join(checkpoint_dir, "x.npy")
-    f_path = os.path.join(checkpoint_dir, "f.npy")
-
-    if os.path.isfile(x_path) and os.path.isfile(f_path):
-        population = np.load(x_path, allow_pickle=True)
-        fitness = np.load(f_path, allow_pickle=True)
-        return population, fitness
-
     full_x_path = os.path.join(checkpoint_dir, "full_x.npy")
     full_f_path = os.path.join(checkpoint_dir, "full_f.npy")
 
     if os.path.isfile(full_x_path) and os.path.isfile(full_f_path):
         full_x = np.load(full_x_path, allow_pickle=True)
         full_f = np.load(full_f_path, allow_pickle=True)
-        population = full_x[-1]
-        fitness = full_f[-1]
-        return population, fitness
 
-    # fallback: last generation folder may contain x.npy / f.npy
+        population = full_x[-1] if full_x.ndim == 3 else full_x
+        fitness = full_f[-1] if full_f.ndim == 3 else full_f
+        return np.asarray(population), np.asarray(fitness)
+
+    x_path = os.path.join(checkpoint_dir, "x.npy")
+    f_path = os.path.join(checkpoint_dir, "f.npy")
+
+    if os.path.isfile(x_path) and os.path.isfile(f_path):
+        population = np.load(x_path, allow_pickle=True)
+        fitness = np.load(f_path, allow_pickle=True)
+        return np.asarray(population), np.asarray(fitness)
+
     last_gen = get_last_checkpoint_dir(checkpoint_dir)
     if last_gen is not None:
         x_path = os.path.join(last_gen, "x.npy")
@@ -62,34 +86,22 @@ def load_final_population_and_fitness(checkpoint_dir: str):
         if os.path.isfile(x_path) and os.path.isfile(f_path):
             population = np.load(x_path, allow_pickle=True)
             fitness = np.load(f_path, allow_pickle=True)
-            return population, fitness
+            return np.asarray(population), np.asarray(fitness)
 
     raise FileNotFoundError(
-        f"Could not find final population/fitness files in '{checkpoint_dir}'. "
-        f"Expected x.npy + f.npy or full_x.npy + full_f.npy."
+        f"Could not find final population/fitness in '{checkpoint_dir}'."
     )
 
 
 # ---------------------------------------------------------------------------
-# Select specialist + generalist from Pareto front
+# Select flat specialist, ice specialist, generalist from Pareto front
 # ---------------------------------------------------------------------------
 
 def extract_specialist_and_generalist(
     checkpoint_dir: str,
     save_dir: Optional[str] = None,
 ):
-    """
-    Extract 3 representative controllers from the final Pareto front:
-    - flat specialist = max flat score on Front 0
-    - ice specialist  = max ice score on Front 0
-    - generalist      = point nearest center of normalized Front 0
-
-    Returns a dict containing genotypes and metadata.
-    """
     population, fitness = load_final_population_and_fitness(checkpoint_dir)
-
-    population = np.asarray(population)
-    fitness = np.asarray(fitness)
 
     if population.ndim != 2:
         raise ValueError(f"Expected population shape (N, D), got {population.shape}")
@@ -100,7 +112,7 @@ def extract_specialist_and_generalist(
         population_size=len(population),
         n_opt_params=population.shape[1],
     )
-    fronts, ranks = nsga.fast_nondominated_sort(fitness)
+    fronts, _ = nsga.fast_nondominated_sort(fitness)
 
     if len(fronts) == 0 or len(fronts[0]) == 0:
         raise RuntimeError("Pareto front is empty.")
@@ -108,42 +120,50 @@ def extract_specialist_and_generalist(
     pareto_indices = np.array(fronts[0], dtype=int)
     pareto_population = population[pareto_indices]
     pareto_fitness = fitness[pareto_indices].astype(np.float32)
- 
-    # Specialists
+
+    # Specialists: extremes on Pareto front
     flat_idx = int(np.argmax(pareto_fitness[:, 0]))
     ice_idx = int(np.argmax(pareto_fitness[:, 1]))
 
-    # Generalist: closest to center of normalized Pareto front
+    # Generalist: maximin on normalized objectives
     fmin = pareto_fitness.min(axis=0)
     fmax = pareto_fitness.max(axis=0)
     denom = np.where((fmax - fmin) > 1e-8, (fmax - fmin), 1.0)
     fit_norm = (pareto_fitness - fmin) / denom
 
-    target = np.array([0.5, 0.5], dtype=np.float32)
-    dists = np.linalg.norm(fit_norm - target[None, :], axis=1)
-    gen_idx = int(np.argmin(dists))
+    balanced_score = np.minimum(fit_norm[:, 0], fit_norm[:, 1])
+    candidate_idxs = np.where(
+        np.isclose(balanced_score, np.max(balanced_score))
+    )[0]
+
+    if len(candidate_idxs) > 1:
+        avg_score = np.mean(fit_norm[candidate_idxs], axis=1)
+        gen_idx = int(candidate_idxs[np.argmax(avg_score)])
+    else:
+        gen_idx = int(candidate_idxs[0])
 
     selected = {
         "pareto_indices": pareto_indices.tolist(),
-
         "flat_specialist": {
             "population_index": int(pareto_indices[flat_idx]),
-            "pareto_local_index": flat_idx,
+            "pareto_local_index": int(flat_idx),
             "fitness": pareto_fitness[flat_idx].tolist(),
+            "normalized_fitness": fit_norm[flat_idx].tolist(),
             "genotype": pareto_population[flat_idx],
         },
-
         "ice_specialist": {
             "population_index": int(pareto_indices[ice_idx]),
-            "pareto_local_index": ice_idx,
+            "pareto_local_index": int(ice_idx),
             "fitness": pareto_fitness[ice_idx].tolist(),
+            "normalized_fitness": fit_norm[ice_idx].tolist(),
             "genotype": pareto_population[ice_idx],
         },
-
         "generalist": {
             "population_index": int(pareto_indices[gen_idx]),
-            "pareto_local_index": gen_idx,
+            "pareto_local_index": int(gen_idx),
             "fitness": pareto_fitness[gen_idx].tolist(),
+            "normalized_fitness": fit_norm[gen_idx].tolist(),
+            "balanced_score": float(balanced_score[gen_idx]),
             "genotype": pareto_population[gen_idx],
         },
     }
@@ -170,16 +190,20 @@ def extract_specialist_and_generalist(
                 "population_index": selected["flat_specialist"]["population_index"],
                 "pareto_local_index": selected["flat_specialist"]["pareto_local_index"],
                 "fitness": selected["flat_specialist"]["fitness"],
+                "normalized_fitness": selected["flat_specialist"]["normalized_fitness"],
             },
             "ice_specialist": {
                 "population_index": selected["ice_specialist"]["population_index"],
                 "pareto_local_index": selected["ice_specialist"]["pareto_local_index"],
                 "fitness": selected["ice_specialist"]["fitness"],
+                "normalized_fitness": selected["ice_specialist"]["normalized_fitness"],
             },
             "generalist": {
                 "population_index": selected["generalist"]["population_index"],
                 "pareto_local_index": selected["generalist"]["pareto_local_index"],
                 "fitness": selected["generalist"]["fitness"],
+                "normalized_fitness": selected["generalist"]["normalized_fitness"],
+                "balanced_score": selected["generalist"]["balanced_score"],
             },
         }
 
@@ -203,17 +227,21 @@ def evaluate_genotype_on_terrain(
 ):
     """
     Evaluate one genotype on one terrain.
+    Returns stats + per-episode rewards + episode seeds.
     """
     env = AntFlatEnvironment(robot_path=robot_path)
     controller = controller_cls(input_size=27, output_size=8)
 
     rng = np.random.default_rng(seed)
     rewards = []
+    episode_seeds = []
 
     controller.geno2pheno(genotype)
 
     for _ in range(n_episodes):
         ep_seed = int(rng.integers(0, 2**31 - 1))
+        episode_seeds.append(ep_seed)
+
         obs, _ = env.reset(seed=ep_seed)
         controller.reset_controller(batch_size=1)
 
@@ -241,8 +269,65 @@ def evaluate_genotype_on_terrain(
         "best": float(np.max(rewards)),
         "worst": float(np.min(rewards)),
         "rewards": rewards.tolist(),
+        "episode_seeds": episode_seeds,
     }
 
+
+def record_controller_video_for_seed(
+    controller_cls,
+    genotype,
+    robot_path: str,
+    out_path: str,
+    max_steps: int = 1000,
+    seed: int = 0,
+):
+    """
+    Record one controller on one terrain using a fixed seed.
+    Returns rollout reward.
+    """
+    env = AntFlatEnvironment(render_mode="rgb_array", robot_path=robot_path)
+    controller = controller_cls(input_size=27, output_size=8)
+    controller.geno2pheno(genotype)
+
+    obs, _ = env.reset(seed=seed)
+    controller.reset_controller(batch_size=1)
+
+    frames = []
+    total_reward = 0.0
+
+    frame = env.render()
+    if frame is not None:
+        frames.append(frame)
+
+    for _ in range(max_steps):
+        action = controller.get_action(obs)
+        if isinstance(action, np.ndarray) and action.ndim > 1:
+            action = action.squeeze(0)
+
+        obs, reward, terminated, truncated, _ = env.step(action)
+        total_reward += float(reward)
+
+        frame = env.render()
+        if frame is not None:
+            frames.append(frame)
+
+        if terminated or truncated:
+            break
+
+    env.close()
+
+    if len(frames) == 0:
+        print(f"Warning: no frames captured for {out_path}")
+        return None
+
+    imageio.mimwrite(out_path, frames, fps=20)
+    print(f"Saved video: {out_path} | reward={total_reward:.2f} | seed={seed}")
+    return float(total_reward)
+
+
+# ---------------------------------------------------------------------------
+# Comparison outputs
+# ---------------------------------------------------------------------------
 
 def evaluate_selected_controllers(
     checkpoint_dir: str,
@@ -252,7 +337,7 @@ def evaluate_selected_controllers(
 ):
     """
     Reevaluate flat specialist, ice specialist, and generalist on both terrains.
-    Saves a comparison table.
+    Saves comparison table and JSON.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -269,7 +354,14 @@ def evaluate_selected_controllers(
     results = {}
     for ctrl_name in ["flat_specialist", "ice_specialist", "generalist"]:
         genotype = selected[ctrl_name]["genotype"]
-        results[ctrl_name] = {}
+        results[ctrl_name] = {
+            "population_index": selected[ctrl_name]["population_index"],
+            "pareto_fitness": selected[ctrl_name]["fitness"],
+            "normalized_pareto_fitness": selected[ctrl_name].get("normalized_fitness"),
+        }
+
+        if ctrl_name == "generalist":
+            results[ctrl_name]["balanced_score"] = selected[ctrl_name].get("balanced_score")
 
         for terrain_name, robot_path in terrains.items():
             stats = evaluate_genotype_on_terrain(
@@ -282,52 +374,68 @@ def evaluate_selected_controllers(
             )
             results[ctrl_name][terrain_name] = stats
 
-    # Save text table
+        flat_mean = results[ctrl_name]["flat"]["mean"]
+        ice_mean = results[ctrl_name]["ice"]["mean"]
+        results[ctrl_name]["comparison_metrics"] = {
+            "mean_of_means": float((flat_mean + ice_mean) / 2.0),
+            "worst_case_mean": float(min(flat_mean, ice_mean)),
+            "gap_between_means": float(abs(flat_mean - ice_mean)),
+        }
+
     table_path = os.path.join(output_dir, "controller_comparison.txt")
     with open(table_path, "w") as f:
-        f.write("=" * 90 + "\n")
+        f.write("=" * 120 + "\n")
         f.write("Controller Comparison: Specialists vs Generalist\n")
-        f.write("=" * 90 + "\n\n")
+        f.write("=" * 120 + "\n\n")
         f.write(
             f"{'Controller':<20}"
             f"{'Flat mean':>12}"
             f"{'Flat std':>12}"
             f"{'Ice mean':>12}"
-            f"{'Ice std':>12}\n"
+            f"{'Ice std':>12}"
+            f"{'Mean':>12}"
+            f"{'Min':>12}"
+            f"{'Gap':>12}\n"
         )
-        f.write("-" * 90 + "\n")
+        f.write("-" * 120 + "\n")
 
         for ctrl_name in ["flat_specialist", "ice_specialist", "generalist"]:
             flat_stats = results[ctrl_name]["flat"]
             ice_stats = results[ctrl_name]["ice"]
+            cm = results[ctrl_name]["comparison_metrics"]
+
             f.write(
                 f"{ctrl_name:<20}"
                 f"{flat_stats['mean']:12.2f}"
                 f"{flat_stats['std']:12.2f}"
                 f"{ice_stats['mean']:12.2f}"
-                f"{ice_stats['std']:12.2f}\n"
+                f"{ice_stats['std']:12.2f}"
+                f"{cm['mean_of_means']:12.2f}"
+                f"{cm['worst_case_mean']:12.2f}"
+                f"{cm['gap_between_means']:12.2f}\n"
             )
 
         f.write("\n")
-        f.write("=" * 90 + "\n")
-        f.write("Selected controller fitness from Pareto front\n")
-        f.write("=" * 90 + "\n")
+        f.write("=" * 120 + "\n")
+        f.write("Selected controller fitness from final Pareto front\n")
+        f.write("=" * 120 + "\n")
         for ctrl_name in ["flat_specialist", "ice_specialist", "generalist"]:
-            fit = selected[ctrl_name]["fitness"]
-            f.write(f"{ctrl_name:<20} flat={fit[0]:.2f}, ice={fit[1]:.2f}\n")
+            fit = results[ctrl_name]["pareto_fitness"]
+            nfit = results[ctrl_name]["normalized_pareto_fitness"]
+            f.write(
+                f"{ctrl_name:<20} "
+                f"flat={fit[0]:.2f}, ice={fit[1]:.2f}, "
+                f"norm_flat={nfit[0]:.3f}, norm_ice={nfit[1]:.3f}"
+            )
+            if ctrl_name == "generalist":
+                f.write(f", balanced_score={results[ctrl_name]['balanced_score']:.3f}")
+            f.write("\n")
 
     print(f"Controller comparison saved to: {table_path}")
 
-    # Save JSON too
     json_path = os.path.join(output_dir, "controller_comparison.json")
-    serializable_results = {}
-    for ctrl_name, ctrl_res in results.items():
-        serializable_results[ctrl_name] = {}
-        for terrain_name, stats in ctrl_res.items():
-            serializable_results[ctrl_name][terrain_name] = stats
-
     with open(json_path, "w") as f:
-        json.dump(serializable_results, f, indent=2)
+        json.dump(results, f, indent=2)
 
     print(f"Controller comparison JSON saved to: {json_path}")
     return results
@@ -350,14 +458,12 @@ def plot_pareto_with_selected(
     os.makedirs(output_dir, exist_ok=True)
 
     population, fitness = load_final_population_and_fitness(checkpoint_dir)
-    population = np.asarray(population)
-    fitness = np.asarray(fitness)
 
     nsga = NSGAII(
         population_size=len(population),
         n_opt_params=population.shape[1],
     )
-    fronts, ranks = nsga.fast_nondominated_sort(fitness)
+    fronts, _ = nsga.fast_nondominated_sort(fitness)
 
     selected = extract_specialist_and_generalist(checkpoint_dir)
 
@@ -404,27 +510,24 @@ def plot_pareto_with_selected(
                 label=f"Front {i}" if i <= 6 else None,
             )
 
-    fs = np.array(selected["flat_specialist"]["fitness"])
-    ispec = np.array(selected["ice_specialist"]["fitness"])
-    gen = np.array(selected["generalist"]["fitness"])
+    fs = np.array(selected["flat_specialist"]["fitness"], dtype=np.float32)
+    ispec = np.array(selected["ice_specialist"]["fitness"], dtype=np.float32)
+    gen = np.array(selected["generalist"]["fitness"], dtype=np.float32)
 
     ax.scatter(
         fs[0], fs[1],
-        s=180, marker="*",
-        label="Flat specialist",
-        zorder=5,
+        s=220, marker="*", label="Flat specialist",
+        zorder=5, edgecolors="black"
     )
     ax.scatter(
         ispec[0], ispec[1],
-        s=180, marker="*",
-        label="Ice specialist",
-        zorder=5,
+        s=220, marker="*", label="Ice specialist",
+        zorder=5, edgecolors="black"
     )
     ax.scatter(
         gen[0], gen[1],
-        s=180, marker="*",
-        label="Generalist",
-        zorder=5,
+        s=220, marker="*", label="Generalist (maximin)",
+        zorder=5, edgecolors="black"
     )
 
     ax.annotate("Flat specialist", (fs[0], fs[1]), xytext=(8, 8), textcoords="offset points")
@@ -449,59 +552,14 @@ def plot_pareto_with_selected(
 # Video generation
 # ---------------------------------------------------------------------------
 
-def record_controller_video(
-    controller_cls,
-    genotype,
-    robot_path: str,
-    out_path: str,
-    max_steps: int = 1000,
-    seed: int = 0,
-):
-    """
-    Record one controller on one terrain to MP4.
-    """
-    env = AntFlatEnvironment(render_mode="rgb_array", robot_path=robot_path)
-    controller = controller_cls(input_size=27, output_size=8)
-    controller.geno2pheno(genotype)
-
-    obs, _ = env.reset(seed=seed)
-    controller.reset_controller(batch_size=1)
-
-    frames = []
-    total_reward = 0.0
-
-    for _ in range(max_steps):
-        frame = env.render()
-        if frame is not None:
-            frames.append(frame)
-
-        action = controller.get_action(obs)
-        if isinstance(action, np.ndarray) and action.ndim > 1:
-            action = action.squeeze(0)
-
-        obs, reward, terminated, truncated, _ = env.step(action)
-        total_reward += float(reward)
-
-        if terminated or truncated:
-            break
-
-    env.close()
-
-    if len(frames) == 0:
-        print(f"Warning: no frames captured for {out_path}")
-        return
-
-    imageio.mimwrite(out_path, frames, fps=20)
-    print(f"Saved video: {out_path} | reward={total_reward:.2f}")
-
-
 def generate_required_videos(
     checkpoint_dir: str,
     controller_cls,
     output_dir: str,
+    n_video_eval_episodes: int = 20,
 ):
     """
-    Generate the required videos:
+    Generate required videos using the best rollout seed found over multiple episodes:
     - flat specialist on flat
     - ice specialist on ice
     - generalist on flat
@@ -510,33 +568,44 @@ def generate_required_videos(
     os.makedirs(output_dir, exist_ok=True)
     selected = extract_specialist_and_generalist(checkpoint_dir)
 
-    record_controller_video(
-        controller_cls=controller_cls,
-        genotype=selected["flat_specialist"]["genotype"],
-        robot_path="ant_flat_terrain.xml",
-        out_path=os.path.join(output_dir, "flat_specialist_on_flat.mp4"),
-    )
+    video_jobs = [
+        ("flat_specialist", "flat", "ant_flat_terrain.xml", "flat_specialist_on_flat.mp4"),
+        ("ice_specialist", "ice", "ant_ice_terrain.xml", "ice_specialist_on_ice.mp4"),
+        ("generalist", "flat", "ant_flat_terrain.xml", "generalist_on_flat.mp4"),
+        ("generalist", "ice", "ant_ice_terrain.xml", "generalist_on_ice.mp4"),
+    ]
 
-    record_controller_video(
-        controller_cls=controller_cls,
-        genotype=selected["ice_specialist"]["genotype"],
-        robot_path="ant_ice_terrain.xml",
-        out_path=os.path.join(output_dir, "ice_specialist_on_ice.mp4"),
-    )
+    for ctrl_name, terrain_name, robot_path, filename in video_jobs:
+        genotype = selected[ctrl_name]["genotype"]
 
-    record_controller_video(
-        controller_cls=controller_cls,
-        genotype=selected["generalist"]["genotype"],
-        robot_path="ant_flat_terrain.xml",
-        out_path=os.path.join(output_dir, "generalist_on_flat.mp4"),
-    )
+        stats = evaluate_genotype_on_terrain(
+            controller_cls=controller_cls,
+            genotype=genotype,
+            robot_path=robot_path,
+            n_episodes=n_video_eval_episodes,
+            max_episode_steps=1000,
+            seed=0,
+        )
 
-    record_controller_video(
-        controller_cls=controller_cls,
-        genotype=selected["generalist"]["genotype"],
-        robot_path="ant_ice_terrain.xml",
-        out_path=os.path.join(output_dir, "generalist_on_ice.mp4"),
-    )
+        rewards = np.asarray(stats["rewards"], dtype=np.float32)
+        seeds = stats["episode_seeds"]
+        best_idx = int(np.argmax(rewards))
+        best_seed = int(seeds[best_idx])
+        best_reward = float(rewards[best_idx])
+
+        print(
+            f"[Video selection] {ctrl_name} on {terrain_name}: "
+            f"best reward={best_reward:.2f}, seed={best_seed}"
+        )
+
+        record_controller_video_for_seed(
+            controller_cls=controller_cls,
+            genotype=genotype,
+            robot_path=robot_path,
+            out_path=os.path.join(output_dir, filename),
+            max_steps=1000,
+            seed=best_seed,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +617,7 @@ def make_submission_outputs(
     controller_cls,
     output_dir: Optional[str] = None,
     n_eval_episodes: int = 30,
+    n_video_eval_episodes: int = 20,
 ):
     """
     Build all Challenge 2 deliverables from one finished checkpoint.
@@ -594,11 +664,12 @@ def make_submission_outputs(
         output_dir=output_dir,
     )
 
-    print("\n[4/4] Generating required videos...")
+    print("\n[4/4] Generating required videos with best-rollout selection...")
     generate_required_videos(
         checkpoint_dir=checkpoint_dir,
         controller_cls=controller_cls,
         output_dir=output_dir,
+        n_video_eval_episodes=n_video_eval_episodes,
     )
 
     print("\nDone.")
@@ -610,14 +681,12 @@ def make_submission_outputs(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Replace with your final checkpoint directory
-    checkpoint_dir = "results/20260402_224520_nsga_ckpts"
+    checkpoint_dir = "results/20260402_234428_oscillatory_nsga_ckpts"
 
-    # Replace with your actual controller class
-    # e.g. CompatibleHybridAntController
     make_submission_outputs(
         checkpoint_dir=checkpoint_dir,
-        controller_cls=CompatibleHybridAntController,
-        output_dir=None,           # defaults to checkpoint_dir/submission_outputs
+        controller_cls=CompatibleOscillatoryAntController,
+        output_dir=None,
         n_eval_episodes=30,
+        n_video_eval_episodes=20,
     )

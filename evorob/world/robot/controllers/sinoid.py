@@ -2,96 +2,124 @@ import numpy as np
 from evorob.world.robot.controllers.base import Controller
 
 
-class PhaseOscillatorController(Controller):
+class OscillatoryController(Controller):
     """
-    Per-joint phase oscillator used ONLY to generate rhythmic phase features.
+    Oscillatory controller using sine waves with:
+        - per-actuator amplitude
+        - per-actuator offset
+        - one shared global frequency
+        - per-actuator phase
 
-    It does NOT output motor actions.
-    It outputs:
-        [sin(phi_i), cos(phi_i)] for each joint i
+    Action for actuator i:
+        a_i(t) = offset_i + amplitude_i * sin(2*pi*frequency*t + phase_i)
 
-    Parameters per joint:
-        - frequency
-        - phase offset
+    Parameters:
+        first output_size      -> amplitudes
+        next output_size       -> offsets
+        next 1                 -> shared frequency
+        last output_size       -> phases
 
-    Total params = 2 * output_size
+    Total params = 3 * output_size + 1
     """
 
-    def __init__(
-        self,
-        output_size: int = 8,
-        dt: float = 0.01,
-        default_frequency: float = 1.0,
-    ):
+    def __init__(self, output_size: int, dt: float = 0.01):
         self.output_size = int(output_size)
         self.dt = float(dt)
         self.time_step = 0.0
+        self.n_params = self.get_num_params()
 
-        self.frequencies = np.full(
-            self.output_size, default_frequency, dtype=np.float32
-        )
+        # Default decoded parameters
+        self.amplitudes = np.ones(self.output_size, dtype=np.float32) * 0.5
+        self.offsets = np.zeros(self.output_size, dtype=np.float32)
+        self.frequency = 1.0
         self.phases = np.zeros(self.output_size, dtype=np.float32)
 
-    def reset_controller(self, batch_size=1):
+    def reset_model(self):
         self.time_step = 0.0
 
-    def step_time(self):
-        self.time_step += self.dt
+    def reset_controller(self, batch_size=1):
+        del batch_size
+        self.time_step = 0.0
 
-    def get_phase(self):
-        return 2.0 * np.pi * self.frequencies * self.time_step + self.phases
-
-    def get_phase_features(self, state=None):
-        """
-        Returns:
-            - (2 * output_size,) for single input / no input
-            - (batch_size, 2 * output_size) for batched input
-
-        If state is batched, tiles the same phase feature vector across the batch.
-        """
-        phase = self.get_phase()
-        sin_phase = np.sin(phase).astype(np.float32)
-        cos_phase = np.cos(phase).astype(np.float32)
-        feat = np.concatenate([sin_phase, cos_phase], axis=0)
-
-        if state is None:
-            return feat
-
-        x = np.asarray(state)
-        if x.ndim == 2:
-            return np.tile(feat[None, :], (x.shape[0], 1))
-
-        return feat
+    def _compute_action_vector(self):
+        phase = 2.0 * np.pi * self.frequency * self.time_step + self.phases
+        actions = self.offsets + self.amplitudes * np.sin(phase)
+        return np.clip(actions, -1.0, 1.0).astype(np.float32)
 
     def get_action(self, state):
         """
-        Kept for API compatibility.
-        Returns phase features, not actions.
+        Supports both:
+        - single observation: shape (obs_dim,) -> returns (output_size,)
+        - batched observation: shape (batch_size, obs_dim) -> returns (batch_size, output_size)
         """
-        feat = self.get_phase_features(state)
-        self.step_time()
-        return feat
+        action_vec = self._compute_action_vector()
+        self.time_step += self.dt
+
+        if state is None:
+            return action_vec
+
+        x = np.asarray(state)
+
+        if x.ndim == 2:
+            batch_size = x.shape[0]
+            return np.tile(action_vec[None, :], (batch_size, 1))
+
+        return action_vec
 
     def set_weights(self, weights):
         """
-        weights format:
-            first output_size  -> frequencies
-            last output_size   -> phases
+        Flat genotype format:
+            first output_size      -> amplitudes
+            next output_size       -> offsets
+            next 1                 -> shared frequency
+            last output_size       -> phases
+
+        Raw parameters are decoded into bounded ranges.
         """
         weights = np.asarray(weights, dtype=np.float32).ravel()
-        expected = 2 * self.output_size
+        expected = self.get_num_params()
         if len(weights) != expected:
             raise ValueError(f"Expected {expected} params, got {len(weights)}")
 
-        self.frequencies = weights[:self.output_size].copy().astype(np.float32)
-        self.phases = weights[self.output_size:].copy().astype(np.float32)
-        self.reset_controller()
+        n = self.output_size
+
+        raw_amp = weights[:n]
+        raw_offset = weights[n:2 * n]
+        raw_freq = weights[2 * n]
+        raw_phase = weights[2 * n + 1:]
+
+        # Amplitudes in [0, 1]
+        self.amplitudes = 1.0 / (1.0 + np.exp(-raw_amp))
+        self.amplitudes = self.amplitudes.astype(np.float32)
+
+        # Offsets in [-0.75, 0.75]
+        # Keeping offsets smaller than full action range avoids constant saturation
+        self.offsets = 0.75 * np.tanh(raw_offset)
+        self.offsets = self.offsets.astype(np.float32)
+
+        # Shared frequency in [0.2, 2.5]
+        self.frequency = float(0.2 + 2.3 * (1.0 / (1.0 + np.exp(-raw_freq))))
+
+        # Phases in [-pi, pi]
+        self.phases = (np.pi * np.tanh(raw_phase)).astype(np.float32)
 
     def get_weights(self):
-        return np.concatenate([self.frequencies, self.phases]).astype(np.float32)
+        """
+        Returns decoded controller parameters concatenated as a flat vector.
+        Note:
+        This is the decoded phenotype, not the original raw genotype.
+        """
+        return np.concatenate(
+            [
+                self.amplitudes,
+                self.offsets,
+                np.array([self.frequency], dtype=np.float32),
+                self.phases,
+            ]
+        ).astype(np.float32)
 
     def get_num_params(self):
-        return 2 * self.output_size
+        return 3 * self.output_size + 1
 
     def geno2pheno(self, genotype):
         self.set_weights(genotype)

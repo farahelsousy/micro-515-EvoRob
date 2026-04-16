@@ -19,335 +19,58 @@ from evorob.utils.filesys import get_last_checkpoint_dir
 from evorob.world.ant_multi_world import AntMultiWorld
 from evorob.world.ant_world import AntFlatWorld
 from evorob.world.envs.ant_flat import AntFlatEnvironment
-from evorob.world.robot.controllers.mlp import NeuralNetworkController
+from evorob.world.robot.controllers.sinoid import OscillatoryController
 
 
 """
 Challenge 2: Multi-objective optimisation on flat + ice terrain
-Updated version:
-- PPO base is frozen
-- Residual MLP is evolved
-- Oscillator is ALSO evolved (unfrozen)
+Oscillatory-controller version.
 """
 
 
 # ---------------------------------------------------------------------------
-# Local hybrid controller definitions
+# Compatibility wrapper
 # ---------------------------------------------------------------------------
 
-class PhaseOscillatorController:
+class CompatibleOscillatoryAntController:
     """
-    Per-joint phase oscillator used only to generate rhythmic phase features.
+    Thin compatibility wrapper so AntMultiWorld can call controller_cls(input_size, output_size),
+    while internally we instantiate the oscillatory controller with:
+        OscillatoryController(output_size=world.action_size)
 
-    Output features:
-        [sin(phi_i), cos(phi_i)] for each joint i
+    New controller parameterization:
+        - per-actuator amplitude
+        - per-actuator offset
+        - one shared frequency
+        - per-actuator phase
 
-    Parameters per joint:
-        - frequency
-        - phase offset
-
-    Total params = 2 * output_size
+    Total params = 3 * output_size + 1
     """
 
-    def __init__(
-        self,
-        output_size: int = 8,
-        dt: float = 0.01,
-        default_frequency: float = 1.0,
-    ):
+    def __init__(self, input_size=None, output_size=8):
+        del input_size  # not used by oscillatory controller
+
         self.output_size = int(output_size)
-        self.dt = float(dt)
-        self.time_step = 0.0
-
-        self.frequencies = np.full(
-            self.output_size, default_frequency, dtype=np.float32
-        )
-        self.phases = np.zeros(self.output_size, dtype=np.float32)
-
-    def reset_controller(self, batch_size=1):
-        self.time_step = 0.0
-
-    def step_time(self):
-        self.time_step += self.dt
-
-    def get_phase(self):
-        return 2.0 * np.pi * self.frequencies * self.time_step + self.phases
-
-    def get_phase_features(self, state=None):
-        phase = self.get_phase()
-        sin_phase = np.sin(phase).astype(np.float32)
-        cos_phase = np.cos(phase).astype(np.float32)
-        feat = np.concatenate([sin_phase, cos_phase], axis=0)
-
-        if state is None:
-            return feat
-
-        x = np.asarray(state)
-        if x.ndim == 2:
-            return np.tile(feat[None, :], (x.shape[0], 1))
-
-        return feat
+        self.controller = OscillatoryController(output_size=self.output_size)
+        self.n_params = self.controller.get_num_params()
 
     def get_action(self, state):
-        feat = self.get_phase_features(state)
-        self.step_time()
-        return feat
+        return self.controller.get_action(state)
 
     def set_weights(self, weights):
-        weights = np.asarray(weights, dtype=np.float32).ravel()
-        expected = 2 * self.output_size
-        if len(weights) != expected:
-            raise ValueError(f"Expected {expected} params, got {len(weights)}")
-
-        self.frequencies = weights[:self.output_size].copy().astype(np.float32)
-        self.phases = weights[self.output_size:].copy().astype(np.float32)
-        self.reset_controller()
-
-    def get_weights(self):
-        return np.concatenate([self.frequencies, self.phases]).astype(np.float32)
+        self.controller.set_weights(weights)
 
     def get_num_params(self):
-        return 2 * self.output_size
+        return self.controller.get_num_params()
 
     def geno2pheno(self, genotype):
-        self.set_weights(genotype)
-
-
-class PhaseHybridResidualController:
-    """
-    Frozen base controller + trainable residual MLP + phase features.
-
-    Final action:
-        action = base_action + residual_scale * residual_action
-    """
-
-    def __init__(
-        self,
-        base_controller,
-        residual_controller,
-        phase_controller,
-        residual_scale: float = 0.15,
-        action_dim: int = 8,
-    ):
-        self.base_controller = base_controller
-        self.residual_controller = residual_controller
-        self.phase_controller = phase_controller
-        self.residual_scale = float(residual_scale)
-        self.action_dim = int(action_dim)
+        self.controller.geno2pheno(genotype)
 
     def reset_controller(self, batch_size=1):
-        if hasattr(self.base_controller, "reset_controller"):
-            self.base_controller.reset_controller(batch_size=batch_size)
-
-        if hasattr(self.residual_controller, "reset_controller"):
-            self.residual_controller.reset_controller(batch_size=batch_size)
-
-        if hasattr(self.phase_controller, "reset_controller"):
-            self.phase_controller.reset_controller(batch_size=batch_size)
-
-    def _augment_state(self, state):
-        state = np.asarray(state, dtype=np.float32)
-        phase_feat = self.phase_controller.get_phase_features(state)
-
-        if state.ndim == 1:
-            return np.concatenate([state, phase_feat], axis=0)
-        elif state.ndim == 2:
-            return np.concatenate([state, phase_feat], axis=1)
-        else:
-            raise ValueError(f"Unsupported state shape: {state.shape}")
-
-    def get_action(self, state):
-        state = np.asarray(state, dtype=np.float32)
-
-        base_action = self.base_controller.get_action(state)
-        aug_state = self._augment_state(state)
-        residual_action = self.residual_controller.get_action(aug_state)
-
-        action = base_action + self.residual_scale * residual_action
-        action = np.clip(action, -1.0, 1.0)
-
-        self.phase_controller.step_time()
-        return action
-
-    def set_weights(self, weights):
-        weights = np.asarray(weights, dtype=np.float32).ravel()
-
-        n_res = self.residual_controller.get_num_params()
-        n_phase = self.phase_controller.get_num_params()
-        expected = n_res + n_phase
-
-        if len(weights) != expected:
-            raise ValueError(f"Expected {expected} params, got {len(weights)}")
-
-        self.residual_controller.set_weights(weights[:n_res])
-        self.phase_controller.set_weights(weights[n_res:n_res + n_phase])
-
-    def get_num_params(self):
-        return (
-            self.residual_controller.get_num_params()
-            + self.phase_controller.get_num_params()
-        )
-
-    def geno2pheno(self, genotype):
-        self.set_weights(genotype)
-
-    def get_phase_info(self):
-        return {
-            "frequencies": self.phase_controller.frequencies.copy(),
-            "phases": self.phase_controller.phases.copy(),
-        }
-
-
-class CompatibleHybridAntController(PhaseHybridResidualController):
-    BASE_HIDDEN = [256, 256]
-    RESIDUAL_HIDDEN = [16]
-    RESIDUAL_SCALE = 0.15
-    DT = 0.01
-    DEFAULT_FREQUENCY = 1.0
-
-    PPO_PATH = "/Users/farahelsousy/Desktop/evolutionary_robotics/micro-515-EvoRob/results/ppo_stage2_ice/ppo_ant_stage2_ice_10000000_steps.zip"
-
-    OLD_HYBRID_GENOTYPE_PATH = (
-        "/Users/farahelsousy/Desktop/evolutionary_robotics/"
-        "micro-515-EvoRob/results/20260319_101259_phase_hybrid_residual_ckpts_best_sofar ice/80/x_best.npy"
-    )
-
-    def __init__(self, input_size, output_size):
-        obs_dim = int(input_size)
-        action_dim = int(output_size)
-        phase_feat_dim = 2 * action_dim
-
-        # --------------------------------------------------
-        # Frozen PPO base controller
-        # --------------------------------------------------
-        base_controller = NeuralNetworkController(
-            input_size=obs_dim,
-            output_size=action_dim,
-            hidden_size=self.BASE_HIDDEN,
-        )
-
-        if os.path.isfile(self.PPO_PATH):
-            try:
-                from stable_baselines3 import PPO
-                model = PPO.load(self.PPO_PATH, device="cpu")
-                base_controller.load_from_ppo_model(model)
-                print(f"[HybridController] Loaded PPO weights from: {self.PPO_PATH}")
-            except Exception as e:
-                print(
-                    f"[HybridController] Warning: failed to load PPO model from "
-                    f"'{self.PPO_PATH}'. Using random frozen base controller instead. "
-                    f"Error: {e}"
-                )
-        else:
-            print(
-                f"[HybridController] Warning: PPO checkpoint not found at "
-                f"'{self.PPO_PATH}'. Using random frozen base controller instead."
-            )
-
-        # --------------------------------------------------
-        # Residual controller
-        # --------------------------------------------------
-        residual_controller = NeuralNetworkController(
-            input_size=obs_dim + phase_feat_dim,
-            output_size=action_dim,
-            hidden_size=self.RESIDUAL_HIDDEN,
-        )
-
-        residual_zero = np.zeros(residual_controller.get_num_params(), dtype=np.float32)
-        residual_controller.set_weights(residual_zero)
-
-        # --------------------------------------------------
-        # Phase oscillator
-        # --------------------------------------------------
-        phase_controller = PhaseOscillatorController(
-            output_size=action_dim,
-            dt=self.DT,
-            default_frequency=self.DEFAULT_FREQUENCY,
-        )
-
-        # --------------------------------------------------
-        # Build hybrid controller
-        # --------------------------------------------------
-        super().__init__(
-            base_controller=base_controller,
-            residual_controller=residual_controller,
-            phase_controller=phase_controller,
-            residual_scale=self.RESIDUAL_SCALE,
-            action_dim=action_dim,
-        )
-
-        # --------------------------------------------------
-        # Warm-start from old hybrid genotype if available
-        # BOTH residual and oscillator are now trainable
-        # --------------------------------------------------
-        if os.path.isfile(self.OLD_HYBRID_GENOTYPE_PATH):
-            try:
-                old_genotype = np.load(self.OLD_HYBRID_GENOTYPE_PATH).astype(np.float32).ravel()
-
-                n_res = self.residual_controller.get_num_params()
-                n_phase = self.phase_controller.get_num_params()
-                expected = n_res + n_phase
-
-                if old_genotype.shape[0] != expected:
-                    raise ValueError(
-                        f"Old hybrid genotype size mismatch: expected {expected}, "
-                        f"got {old_genotype.shape[0]}"
-                    )
-
-                old_residual = old_genotype[:n_res]
-                old_phase = old_genotype[n_res:n_res + n_phase]
-
-                self.residual_controller.set_weights(old_residual)
-                self.phase_controller.set_weights(old_phase)
-
-                print(
-                    f"[HybridController] Loaded old hybrid genotype from: "
-                    f"{self.OLD_HYBRID_GENOTYPE_PATH}"
-                )
-
-            except Exception as e:
-                print(
-                    "[HybridController] Warning: failed to load old hybrid genotype. "
-                    f"Using zero residual + default oscillator. Error: {e}"
-                )
-        else:
-            print(
-                "[HybridController] Warning: old hybrid genotype not found at "
-                f"'{self.OLD_HYBRID_GENOTYPE_PATH}'. Using default oscillator."
-            )
-
-        self.input_size = obs_dim
-        self.output_size = action_dim
-        self.n_params = self.get_num_params()
-
-    def set_weights(self, weights):
-        """
-        Residual + oscillator evolution:
-        genotype = [residual_params | oscillator_params]
-        """
-        weights = np.asarray(weights, dtype=np.float32).ravel()
-
-        n_res = self.residual_controller.get_num_params()
-        n_phase = self.phase_controller.get_num_params()
-        expected = n_res + n_phase
-
-        if len(weights) != expected:
-            raise ValueError(f"Expected {expected} params, got {len(weights)}")
-
-        self.residual_controller.set_weights(weights[:n_res])
-        self.phase_controller.set_weights(weights[n_res:n_res + n_phase])
-
-    def get_num_params(self):
-        """
-        Evolve both residual and oscillator parameters.
-        """
-        return (
-            self.residual_controller.get_num_params()
-            + self.phase_controller.get_num_params()
-        )
-
-    def geno2pheno(self, genotype):
-        self.set_weights(genotype)
+        if hasattr(self.controller, "reset_controller"):
+            self.controller.reset_controller(batch_size=batch_size)
+        elif hasattr(self.controller, "reset_model"):
+            self.controller.reset_model()
 
 
 # ---------------------------------------------------------------------------
@@ -355,12 +78,45 @@ class CompatibleHybridAntController(PhaseHybridResidualController):
 # ---------------------------------------------------------------------------
 
 def test_exercise_implementation():
-    """Test NSGA-II implementation components."""
+    """Test NSGA-II implementation components and oscillatory controller."""
     print("\n" + "=" * 60)
     print("EXERCISE 2: Testing NSGA-II Components")
     print("=" * 60)
 
-    print("\n[1/5] Testing Pareto Dominance...")
+    print("\n[0/6] Testing Oscillatory Controller...")
+    try:
+        controller = OscillatoryController(output_size=8)
+        expected_params = 3 * 8 + 1
+        assert controller.n_params == expected_params, (
+            f"Should have {expected_params} params (3*8 + 1), got {controller.n_params}"
+        )
+
+        test_obs = np.random.randn(27)
+        actions = controller.get_action(test_obs)
+        assert actions.shape == (8,), (
+            f"Action shape should be (8,), got {actions.shape}"
+        )
+        assert np.all(actions >= -1.0) and np.all(actions <= 1.0), (
+            "Actions outside [-1, 1]"
+        )
+
+        batched_obs = np.random.randn(4, 27)
+        batched_actions = controller.get_action(batched_obs)
+        assert batched_actions.shape == (4, 8), (
+            f"Batched actions should be (4, 8), got {batched_actions.shape}"
+        )
+
+        test_weights = np.random.uniform(-1, 1, controller.n_params)
+        controller.set_weights(test_weights)
+        actions_after = controller.get_action(test_obs)
+        assert actions_after.shape == (8,), "Actions shape changed after set_weights"
+
+        print("✅ Oscillatory Controller works correctly!")
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        raise
+
+    print("\n[1/6] Testing Pareto Dominance...")
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
 
@@ -370,17 +126,11 @@ def test_exercise_implementation():
         assert nsga.dominates([4, 3], [4, 3]) is False
 
         print("✅ Dominance function works correctly!")
-    except NotImplementedError as e:
-        print(f"❌ Not implemented: {str(e)}")
-        exit(1)
-    except AssertionError as e:
-        print(f"❌ Assertion failed: {str(e)}")
-        exit(1)
     except Exception as e:
         print(f"❌ Error: {type(e).__name__}: {str(e)}")
-        exit(1)
+        raise
 
-    print("\n[2/5] Testing Fast Non-Dominated Sorting...")
+    print("\n[2/6] Testing Fast Non-Dominated Sorting...")
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
 
@@ -407,17 +157,11 @@ def test_exercise_implementation():
         assert ranks[5] == 2
 
         print(f"✅ Sorting correctly identified {len(fronts)} fronts!")
-    except NotImplementedError as e:
-        print(f"❌ Not implemented: {str(e)}")
-        exit(1)
-    except AssertionError as e:
-        print(f"❌ Assertion failed: {str(e)}")
-        exit(1)
     except Exception as e:
         print(f"❌ Error: {type(e).__name__}: {str(e)}")
-        exit(1)
+        raise
 
-    print("\n[3/5] Testing Crowding Distance...")
+    print("\n[3/6] Testing Crowding Distance...")
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
 
@@ -431,7 +175,6 @@ def test_exercise_implementation():
             ]
         )
         front_indices = [0, 1, 2, 3, 4]
-
         distances = nsga.compute_crowding_distance(test_fitness, front_indices)
 
         assert distances[0] == np.inf
@@ -443,12 +186,10 @@ def test_exercise_implementation():
         print("✅ Crowding distance works correctly!")
     except NotImplementedError:
         print("⏭️  Skipped (not implemented)")
-    except AssertionError as e:
-        print(f"⚠️  Implementation issue: {str(e)}")
     except Exception as e:
         print(f"⚠️  Error: {type(e).__name__}: {str(e)}")
 
-    print("\n[4/5] Testing Crowding Operator...")
+    print("\n[4/6] Testing Crowding Operator...")
     try:
         nsga = NSGAII(population_size=10, n_opt_params=5)
 
@@ -464,39 +205,35 @@ def test_exercise_implementation():
         print("✅ Crowding operator works correctly!")
     except NotImplementedError:
         print("⏭️  Skipped (not implemented)")
-    except AssertionError as e:
-        print(f"⚠️  Implementation issue: {str(e)}")
     except Exception as e:
         print(f"⚠️  Error: {type(e).__name__}: {str(e)}")
 
-    print("\n[5/5] Testing Enhanced Parent Selection...")
+    print("\n[5/6] Testing AntMultiWorld compatibility...")
     try:
-        nsga = NSGAII(population_size=10, n_opt_params=5, n_parents=5)
-
-        test_population = np.random.uniform(-1, 1, (10, 5))
-        test_fitness = np.random.uniform(0, 10, (10, 2))
-
-        parents, parent_fitness = nsga.sort_and_select_parents(
-            test_population, test_fitness, n_parents=5
+        world = AntMultiWorld(
+            controller_cls=CompatibleOscillatoryAntController,
+            n_repeats=6,
         )
+        print(f"Observation space: {world.obs_size}")
+        print(f"Action space: {world.action_size}")
+        print(f"Controller parameters: {world.n_params}")
 
-        assert parents.shape == (5, 5)
-        assert parent_fitness.shape == (5, 2)
-
-        print("✅ Parent selection works!")
-    except AssertionError as e:
-        print(f"⚠️  Implementation issue: {str(e)}")
+        random_genotype = np.random.uniform(-1, 1, world.n_params)
+        fitness = world.evaluate_individual(random_genotype)
+        print(f"Random individual fitness: {fitness}")
+        print("✅ AntMultiWorld compatibility works!")
     except Exception as e:
-        print(f"⚠️  Error: {type(e).__name__}: {str(e)}")
+        print(f"❌ Error: {type(e).__name__}: {str(e)}")
+        raise
 
     print("\n" + "=" * 60)
-    print("🎉 NSGA-II tests passed!")
+    print("🎉 All tests passed!")
     print("=" * 60 + "\n")
 
 
 def inspect_ant_multi_world():
-    """Test the AntMultiWorld environment."""
-    world = AntMultiWorld(controller_cls=CompatibleHybridAntController)
+    """Test the AntMultiWorld environment with the oscillatory controller."""
+    world = AntMultiWorld(controller_cls=CompatibleOscillatoryAntController)
     print(f"Observation space: {world.obs_size}")
     print(f"Action space: {world.action_size}")
     print(f"Controller parameters: {world.n_params}")
@@ -648,6 +385,7 @@ def _run_episodes(env, controller, genotype, n_episodes, max_episode_steps, seed
             action = controller.get_action(obs)
             if isinstance(action, np.ndarray) and action.ndim > 1:
                 action = action.squeeze(0)
+
             obs, reward, terminated, truncated, _ = env.step(action)
             total_reward += reward
             if terminated or truncated:
@@ -676,6 +414,7 @@ def _record_video(env_cls, robot_path, controller, genotype, max_steps, seed, ou
             action = controller.get_action(obs)
             if isinstance(action, np.ndarray) and action.ndim > 1:
                 action = action.squeeze(0)
+
             obs, reward, terminated, truncated, _ = env.step(action)
             video_reward += reward
 
@@ -687,8 +426,13 @@ def _record_video(env_cls, robot_path, controller, genotype, max_steps, seed, ou
                 break
 
         env.close()
-        imageio.mimwrite(out_path, frames, fps=20)
-        print(f"  Video saved to: {out_path}")
+
+        if len(frames) > 0:
+            imageio.mimwrite(out_path, frames, fps=20)
+            print(f"  Video saved to: {out_path}")
+        else:
+            print("  Warning: No frames rendered, video not saved.")
+
         return video_reward
     except Exception as e:
         print(f"  Warning: Video recording skipped (rendering unavailable): {e}")
@@ -699,10 +443,7 @@ def evaluate_checkpoint(
     checkpoint_dir: str,
     output_dir: str = "evaluation_output",
 ):
-    """
-    Evaluate x_best checkpoint on both custom environments.
-    Note: this is still a single-controller evaluation helper, not the Pareto deliverable.
-    """
+    """Evaluate x_best checkpoint on both terrains."""
     n_episodes: int = 256
     max_episode_steps: int = 1000
     seed: int = 0
@@ -720,9 +461,9 @@ def evaluate_checkpoint(
     genotype = np.load(x_best_path)
     print(f"Loaded genotype from: {x_best_path}  (shape: {genotype.shape})")
 
-    controller = CompatibleHybridAntController(input_size=27, output_size=8)
+    controller = CompatibleOscillatoryAntController(input_size=27, output_size=8)
     print(
-        f"Controller: CompatibleHybridAntController  |  Parameters: {controller.n_params}\n"
+        f"Controller: CompatibleOscillatoryAntController  |  Parameters: {controller.n_params}\n"
     )
 
     terrains = {
@@ -757,8 +498,13 @@ def evaluate_checkpoint(
     for terrain_name, robot_path in terrains.items():
         video_path = os.path.join(output_dir, f"evaluation_{terrain_name}.mp4")
         _record_video(
-            AntFlatEnvironment, robot_path, controller, genotype,
-            max_episode_steps, seed, video_path,
+            AntFlatEnvironment,
+            robot_path,
+            controller,
+            genotype,
+            max_episode_steps,
+            seed,
+            video_path,
         )
 
     score_path = os.path.join(output_dir, "evaluation_score.txt")
@@ -766,7 +512,7 @@ def evaluate_checkpoint(
         f.write("=" * 50 + "\n")
         f.write("MICRO-515 Challenge 2 - Evaluation Results\n")
         f.write("=" * 50 + "\n\n")
-        f.write("Controller type : CompatibleHybridAntController\n")
+        f.write("Controller type : CompatibleOscillatoryAntController\n")
         f.write(f"Checkpoint      : {checkpoint_dir}\n")
         f.write(f"Episodes/terrain: {n_episodes}\n\n")
 
@@ -783,19 +529,16 @@ def evaluate_checkpoint(
             )
         f.write("\n")
 
-        for terrain_name in terrains:
-            r = results[terrain_name]
-            f.write("-" * 50 + "\n")
-            f.write(f"{terrain_name.upper()} TERRAIN — Per-episode rewards\n")
-            f.write("-" * 50 + "\n")
-            for i, rew in enumerate(r["rewards"]):
-                f.write(f"  Episode {i + 1:3d}: {rew:10.2f}\n")
-            f.write("\n")
-
     print(f"\nScore saved to: {score_path}")
     print(f"\n{'=' * 50}")
-    print(f"  FLAT : {results['flat']['mean']:.2f} +/- {results['flat']['std']:.2f}  (best: {results['flat']['best']:.2f})")
-    print(f"  ICE  : {results['ice']['mean']:.2f} +/- {results['ice']['std']:.2f}  (best: {results['ice']['best']:.2f})")
+    print(
+        f"  FLAT : {results['flat']['mean']:.2f} +/- {results['flat']['std']:.2f}  "
+        f"(best: {results['flat']['best']:.2f})"
+    )
+    print(
+        f"  ICE  : {results['ice']['mean']:.2f} +/- {results['ice']['std']:.2f}  "
+        f"(best: {results['ice']['best']:.2f})"
+    )
     print(f"{'=' * 50}")
 
     return results
@@ -813,7 +556,7 @@ def run_evolution_nsga(
     compute_score: bool,
     random_seed: int,
     n_repeats: int,
-    mutation_prob: float,
+    mutation_prob: Optional[float],
     crossover_prob: float,
     bounds: Tuple[float, float],
     n_parents: int,
@@ -823,13 +566,16 @@ def run_evolution_nsga(
     np.random.seed(random_seed)
 
     world = AntMultiWorld(
-        controller_cls=CompatibleHybridAntController,
+        controller_cls=CompatibleOscillatoryAntController,
         n_repeats=n_repeats,
     )
 
+    if mutation_prob is None:
+        mutation_prob = 1.0 / world.n_params
+
     dt_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     if checkpoint_path is None:
-        checkpoint_path = f"results/{dt_str}_nsga_ckpts"
+        checkpoint_path = f"results/{dt_str}_oscillatory_nsga_ckpts"
     else:
         checkpoint_path = str(
             Path(checkpoint_path).parent / f"{dt_str}_{Path(checkpoint_path).name}"
@@ -876,12 +622,12 @@ def run_evolution_nsga(
         f"Population: {population_size} | Generations: {num_generations} | "
         f"Parents: {nsga.n_parents}"
     )
-    print(f"Objective 1: Flat Terrain Speed | Objective 2: Ice Terrain Speed")
+    print("Objective 1: Flat terrain fitness | Objective 2: Ice terrain fitness")
     print("=" * 70 + "\n")
 
     for generation in range(num_generations):
         population = nsga.ask()
-        multi_fitness = np.empty((len(population), 2))
+        multi_fitness = np.empty((len(population), 2), dtype=np.float32)
 
         for i, individual in enumerate(population):
             multi_fitness[i] = world.evaluate_individual(individual)
@@ -916,15 +662,15 @@ def run_evolution_nsga(
 
     final_fitness = np.array(nsga.full_f)[-1]
     plot_pareto_fronts(
-        final_fitness, ckpt_dir,
+        final_fitness,
+        ckpt_dir,
         num_generations=num_generations,
         population_size=population_size,
     )
 
-    eval_results = None
     if compute_score:
         try:
-            eval_results = evaluate_checkpoint(
+            evaluate_checkpoint(
                 checkpoint_dir=str(ckpt_dir),
                 output_dir=str(ckpt_dir),
             )
@@ -943,6 +689,8 @@ def run_evolution_nsga(
                 evaluation_controller.geno2pheno(best_population[best_flat_idx])
 
                 obs, _ = evaluation_env.reset()
+                evaluation_controller.reset_controller(batch_size=1)
+
                 trial_reward = 0.0
                 trial_count = 0
 
@@ -958,6 +706,7 @@ def run_evolution_nsga(
                             print(f"Trial {trial_count} reward: {float(trial_reward):.2f}")
                             trial_reward = 0.0
                             obs, _ = evaluation_env.reset()
+                            evaluation_controller.reset_controller(batch_size=1)
                 except KeyboardInterrupt:
                     print(f"\n\nEvaluation stopped by user after {trial_count} trials.")
                 finally:
@@ -981,9 +730,9 @@ def replay_checkpoint(checkpoint_path: str):
         raise FileNotFoundError(f"Checkpoint file not found: {x_path}")
 
     population = np.load(x_path)
-    world = AntMultiWorld(controller_cls=CompatibleHybridAntController)
+    world = AntMultiWorld(controller_cls=CompatibleOscillatoryAntController)
 
-    multi_fitness = np.empty((len(population), 2))
+    multi_fitness = np.empty((len(population), 2), dtype=np.float32)
     for i, individual in enumerate(population):
         multi_fitness[i] = world.evaluate_individual(individual)
 
@@ -1008,7 +757,7 @@ def replay_checkpoint(checkpoint_path: str):
 
     n_evals = 5
     for idx_eval in range(n_evals):
-        ant_ice_world = AntFlatWorld(controller_cls=CompatibleHybridAntController)
+        ant_ice_world = AntFlatWorld(controller_cls=CompatibleOscillatoryAntController)
         ant_ice_world.generate_best_individual_video(
             env=ant_ice_world.create_env(
                 robot_path="ant_ice_terrain.xml", width=800, height=608
@@ -1017,7 +766,7 @@ def replay_checkpoint(checkpoint_path: str):
             controller=ant_ice_world.geno2pheno(population[best_ice_idx]),
         )
 
-        ant_flat_world = AntFlatWorld(controller_cls=CompatibleHybridAntController)
+        ant_flat_world = AntFlatWorld(controller_cls=CompatibleOscillatoryAntController)
         ant_flat_world.generate_best_individual_video(
             env=ant_flat_world.create_env(
                 robot_path="ant_flat_terrain.xml", width=800, height=608
@@ -1036,13 +785,13 @@ if __name__ == "__main__":
     test_exercise_implementation()
 
     run_evolution_nsga(
-        num_generations=50,
-        population_size=200,
-        n_parents=20,
-        n_repeats=6,
-        mutation_prob=0.02,
+        num_generations=20,
+        population_size=100,
+        n_parents=80,
+        n_repeats=2,
+        mutation_prob=0.1,   # automatically set to 1 / n_params
         crossover_prob=0.8,
-        bounds=(-0.05, 0.05),
+        bounds=(-1.0, 1.0),
         compute_score=True,
         run_evaluation=True,
         random_seed=42,
@@ -1051,10 +800,10 @@ if __name__ == "__main__":
 
     """
     replay_checkpoint(
-         checkpoint_path="./results/nsga_multi_terrain_ckpt/99"
-     )
+        checkpoint_path="./results/oscillatory_nsga_ckpt/99"
+    )
 
     plot_pareto_fronts_from_checkpoint(
-         checkpoint_dir="./results/nsga_multi_terrain_ckpt/99"
-     )
+        checkpoint_dir="./results/oscillatory_nsga_ckpt/99"
+    )
     """

@@ -45,7 +45,7 @@ class PPOOnlyAntController:
     """
 
     BASE_HIDDEN = [256, 256]
-    PPO_PATH = "micro-515-EvoRob/results/ppo_ckpts_both/ppo_ant_both_4000000_steps.zip"
+    PPO_PATH = "/Users/farahelsousy/Desktop/evolutionary_robotics/micro-515-EvoRob/results/ppo_stage2_ice/ppo_ant_stage2_ice_10000000_steps.zip"
 
     def __init__(self, input_size, output_size):
         obs_dim = int(input_size)
@@ -856,9 +856,9 @@ if __name__ == "__main__":
     test_exercise_implementation()
     run_evolution_nsga(
         num_generations=50,
-        population_size=120,
-        n_parents=50,
-        n_repeats=6,
+        population_size=50,
+        n_parents=10,
+        n_repeats=2,
         mutation_prob=0.02,
         crossover_prob=0.8,
         bounds=(-0.05, 0.05),
