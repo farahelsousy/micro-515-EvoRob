@@ -155,9 +155,9 @@ class AntWorld(World):
         # 1. Create the Slope (Gradient along X)
         # 0.0 at the back, 1.0 at the front
         # TODO: Change the terrain parameters
-        slope_deg = 0.0
-        bump_scale = 0.0
-        sigma = 1.0
+        slope_deg = 5.0
+        bump_scale = 0.1
+        sigma = 3.0
 
         # 1. Create Linear Slope (Gradient along X)
         rise = np.tan(np.deg2rad(slope_deg))
@@ -256,9 +256,12 @@ def main():
     # TODO Overwrite controller and load best run exercise 1
     state_space = ...
     action_space = ... # Change controller
-    world.controller = NeuralNetworkController(...,
-                                               ...,
-                                               ...)
+    
+    world.controller = NeuralNetworkController(
+        input_size=state_space,
+        output_size=action_space,
+        hidden_size=action_space
+    )
     world.n_weights = world.controller.n_params
     world.n_params = world.n_weights + world.n_body_params
 
@@ -266,8 +269,8 @@ def main():
     prev_best = ... # load previous run
     genotype[:-8] = prev_best
 
-    genotype[-8::2] = ...  # fix upper leg length 0.2
-    genotype[-7::2] = ...     # fix lower leg length 0.6
+    genotype[-8::2] = 0.2  # fix upper leg length 0.2
+    genotype[-7::2] = 1.0    # fix lower leg length 0.6
     world.update_robot_xml(genotype)
     world.visualise_individual(genotype)
 
