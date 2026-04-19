@@ -4,7 +4,7 @@ from os.path import join
 from tempfile import TemporaryDirectory
 from PIL import Image
 import scipy.ndimage
-
+from stable_baselines3 import PPO
 import gymnasium as gym
 import numpy as np
 from gymnasium.vector import AsyncVectorEnv
@@ -19,7 +19,7 @@ from evorob.utils.filesys import (
     get_project_root,
 )
 from evorob.world.base import World
-from evorob.world.robot.controllers.mlp_sol import NeuralNetworkController
+from evorob.world.robot.controllers.mlp import NeuralNetworkController
 from evorob.world.robot.controllers.so2 import SO2Controller
 from evorob.world.robot.controllers.mlp_hebbian import HebbianController
 from evorob.world.robot.morphology.ant_custom_robot import AntRobot
@@ -252,28 +252,46 @@ def main():
     genotype = np.random.uniform(-1,1, n_parameters)
     world.update_robot_xml(genotype)
     world.visualise_individual(genotype)
-
-    # TODO Overwrite controller and load best run exercise 1
-    state_space = ...
-    action_space = ... # Change controller
     
+    # TODO Overwrite controller and load best run exercise 1
+    state_space = 27
+    action_space = 8  # Change controller
+        
+    model_path = "/Users/farahelsousy/Desktop/evolutionary_robotics/micro-515-EvoRob/results/ppo_ckpts/ppo_ant_10000000_steps.zip"
+    model = PPO.load(model_path, device="cpu")
+
+    policy_net = model.policy.mlp_extractor.policy_net
+    hidden_sizes = []
+    for layer in policy_net:
+        if hasattr(layer, "weight") and hasattr(layer, "bias"):
+            hidden_sizes.append(int(layer.weight.shape[0]))
+
     world.controller = NeuralNetworkController(
         input_size=state_space,
         output_size=action_space,
-        hidden_size=action_space
+        hidden_size=hidden_sizes
     )
+    world.controller.load_from_ppo_model(model)
     world.n_weights = world.controller.n_params
     world.n_params = world.n_weights + world.n_body_params
+    genotype = np.random.uniform(-1, 1, world.n_params).astype(np.float32)
 
-    result_dir = ...
-    prev_best = ... # load previous run
-    genotype[:-8] = prev_best
+    flat_parts = []
+    for W, b in zip(world.controller.weights, world.controller.biases):
+        flat_parts.append(W.reshape(-1))
+        flat_parts.append(b.reshape(-1))
+    ppo_flat = np.concatenate(flat_parts).astype(np.float32)
 
-    genotype[-8::2] = 0.2  # fix upper leg length 0.2
-    genotype[-7::2] = 1.0    # fix lower leg length 0.6
+    genotype[:world.n_weights] = ppo_flat
+    #result_dir = ...
+    #prev_best = ... # load previous run
+    #genotype[:-8] = prev_best
+    genotype = np.random.uniform(-1, 1, world.n_params).astype(np.float32)
+    #genotype[-8::2] = -0.6  # fix upper leg length 0.2
+    #genotype[-7::2] = 0.2   # fix lower leg length 0.6
     world.update_robot_xml(genotype)
     world.visualise_individual(genotype)
-
+    return
 
     # %% Evolve open-loop so2
     world = AntWorld()
