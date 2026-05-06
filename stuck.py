@@ -24,6 +24,7 @@ from evorob.world.robot.controllers.mlp_hebbian import HebbianController
 from evorob.world.robot.controllers.so2 import SO2Controller
 from evorob.world.robot.morphology.ant_custom_robot import AntRobot
 
+
 """
 Morphology and Controller optimisation: Ant Hill
 """
@@ -37,6 +38,73 @@ def length_to_genotype(length: float) -> float:
     length = (g + 1)/4 + 0.1  ->  g = 4*(length - 0.1) - 1
     """
     return 4 * (length - 0.1) - 1
+
+
+class SwitchingMLPController:
+    """
+    Two-controller version:
+    - normal controller
+    - recovery controller
+
+    The switching logic is handled in AntWorld.evaluate_individual().
+    """
+
+    def __init__(self, input_size: int, output_size: int, hidden_size=8):
+        self.normal = NeuralNetworkController(
+            input_size=input_size,
+            output_size=output_size,
+            hidden_size=hidden_size,
+        )
+        self.recovery = NeuralNetworkController(
+            input_size=input_size,
+            output_size=output_size,
+            hidden_size=hidden_size,
+        )
+
+        self.single_n_params = self.normal.n_params
+        self.n_params = self.normal.n_params + self.recovery.n_params
+
+    def geno2pheno(self, genotype):
+        genotype = np.asarray(genotype, dtype=np.float32).ravel()
+        assert len(genotype) == self.n_params, (
+            f"Switching controller expected {self.n_params} params, "
+            f"got {len(genotype)}"
+        )
+
+        g1 = genotype[:self.single_n_params]
+        g2 = genotype[self.single_n_params:]
+
+        self.normal.geno2pheno(g1)
+        self.recovery.geno2pheno(g2)
+
+    def get_action(self, state, recovery_mask=None):
+        """
+        recovery_mask:
+            - None -> use normal controller only
+            - bool scalar -> choose one controller for single input
+            - bool array of shape (batch,) -> choose per environment
+        """
+        if recovery_mask is None:
+            return self.normal.get_action(state)
+
+        x = np.asarray(state, dtype=np.float32)
+
+        # single observation case
+        if x.ndim == 1:
+            if bool(recovery_mask):
+                return self.recovery.get_action(x)
+            return self.normal.get_action(x)
+
+        # batch case
+        normal_actions = self.normal.get_action(x)
+        recovery_actions = self.recovery.get_action(x)
+
+        recovery_mask = np.asarray(recovery_mask, dtype=bool).reshape(-1, 1)
+        return np.where(recovery_mask, recovery_actions, normal_actions)
+
+    def reset_controller(self, batch_size=1):
+        self.normal.reset_controller(batch_size=batch_size)
+        self.recovery.reset_controller(batch_size=batch_size)
 
 
 class AntWorld(World):
@@ -116,16 +184,23 @@ class AntWorld(World):
         return envs
 
     def geno2pheno(self, genotype):
-        # Use full weights for transferred MLPs, scaled weights for evolutionary controllers
-        if isinstance(self.controller, NeuralNetworkController):
+        genotype = np.asarray(genotype, dtype=np.float32).ravel()
+
+        # Use full weights for MLP-based controllers
+        if isinstance(self.controller, (NeuralNetworkController, SwitchingMLPController)):
             control_weights = genotype[:self.n_weights]
         else:
+            # keep your original scaling for SO2 / Hebbian if desired
             control_weights = genotype[:self.n_weights] * 0.1
 
         body_params = (genotype[self.n_weights:] + 1) / 4 + 0.1
 
-        assert len(body_params) == self.n_body_params
-        assert len(control_weights) == self.n_weights
+        assert len(body_params) == self.n_body_params, (
+            f"Expected {self.n_body_params} body params, got {len(body_params)}"
+        )
+        assert len(control_weights) == self.n_weights, (
+            f"Expected {self.n_weights} controller params, got {len(control_weights)}"
+        )
         assert not np.any(body_params <= 0)
 
         self.controller.geno2pheno(control_weights)
@@ -143,108 +218,82 @@ class AntWorld(World):
 
         front_left_hip_xyz = np.array([0.2, 0.2, 0])
         front_left_knee_xyz = (
-            np.array(
-                [
-                    np.sqrt(0.5 * front_left_leg**2),
-                    np.sqrt(0.5 * front_left_leg**2),
-                    0,
-                ]
-            )
-            + front_left_hip_xyz
+            np.array([
+                np.sqrt(0.5 * front_left_leg**2),
+                np.sqrt(0.5 * front_left_leg**2),
+                0,
+            ]) + front_left_hip_xyz
         )
         front_left_toe_xyz = (
-            np.array(
-                [
-                    np.sqrt(0.5 * front_left_ankle**2),
-                    np.sqrt(0.5 * front_left_ankle**2),
-                    0,
-                ]
-            )
-            + front_left_knee_xyz
+            np.array([
+                np.sqrt(0.5 * front_left_ankle**2),
+                np.sqrt(0.5 * front_left_ankle**2),
+                0,
+            ]) + front_left_knee_xyz
         )
 
         front_right_hip_xyz = np.array([-0.2, 0.2, 0])
         front_right_knee_xyz = (
-            np.array(
-                [
-                    -np.sqrt(0.5 * front_right_leg**2),
-                    np.sqrt(0.5 * front_right_leg**2),
-                    0,
-                ]
-            )
-            + front_right_hip_xyz
+            np.array([
+                -np.sqrt(0.5 * front_right_leg**2),
+                np.sqrt(0.5 * front_right_leg**2),
+                0,
+            ]) + front_right_hip_xyz
         )
         front_right_toe_xyz = (
-            np.array(
-                [
-                    -np.sqrt(0.5 * front_right_ankle**2),
-                    np.sqrt(0.5 * front_right_ankle**2),
-                    0,
-                ]
-            )
-            + front_right_knee_xyz
+            np.array([
+                -np.sqrt(0.5 * front_right_ankle**2),
+                np.sqrt(0.5 * front_right_ankle**2),
+                0,
+            ]) + front_right_knee_xyz
         )
 
         back_left_hip_xyz = np.array([-0.2, -0.2, 0])
         back_left_knee_xyz = (
-            np.array(
-                [
-                    -np.sqrt(0.5 * back_left_leg**2),
-                    -np.sqrt(0.5 * back_left_leg**2),
-                    0,
-                ]
-            )
-            + back_left_hip_xyz
+            np.array([
+                -np.sqrt(0.5 * back_left_leg**2),
+                -np.sqrt(0.5 * back_left_leg**2),
+                0,
+            ]) + back_left_hip_xyz
         )
         back_left_toe_xyz = (
-            np.array(
-                [
-                    -np.sqrt(0.5 * back_left_ankle**2),
-                    -np.sqrt(0.5 * back_left_ankle**2),
-                    0,
-                ]
-            )
-            + back_left_knee_xyz
+            np.array([
+                -np.sqrt(0.5 * back_left_ankle**2),
+                -np.sqrt(0.5 * back_left_ankle**2),
+                0,
+            ]) + back_left_knee_xyz
         )
 
         back_right_hip_xyz = np.array([0.2, -0.2, 0])
         back_right_knee_xyz = (
-            np.array(
-                [
-                    np.sqrt(0.5 * back_right_leg**2),
-                    -np.sqrt(0.5 * back_right_leg**2),
-                    0,
-                ]
-            )
-            + back_right_hip_xyz
+            np.array([
+                np.sqrt(0.5 * back_right_leg**2),
+                -np.sqrt(0.5 * back_right_leg**2),
+                0,
+            ]) + back_right_hip_xyz
         )
         back_right_toe_xyz = (
-            np.array(
-                [
-                    np.sqrt(0.5 * back_right_ankle**2),
-                    -np.sqrt(0.5 * back_right_ankle**2),
-                    0,
-                ]
-            )
-            + back_right_knee_xyz
+            np.array([
+                np.sqrt(0.5 * back_right_ankle**2),
+                -np.sqrt(0.5 * back_right_ankle**2),
+                0,
+            ]) + back_right_knee_xyz
         )
 
-        points = np.vstack(
-            [
-                front_left_hip_xyz,
-                front_left_knee_xyz,
-                front_left_toe_xyz,
-                front_right_hip_xyz,
-                front_right_knee_xyz,
-                front_right_toe_xyz,
-                back_left_hip_xyz,
-                back_left_knee_xyz,
-                back_left_toe_xyz,
-                back_right_hip_xyz,
-                back_right_knee_xyz,
-                back_right_toe_xyz,
-            ]
-        )
+        points = np.vstack([
+            front_left_hip_xyz,
+            front_left_knee_xyz,
+            front_left_toe_xyz,
+            front_right_hip_xyz,
+            front_right_knee_xyz,
+            front_right_toe_xyz,
+            back_left_hip_xyz,
+            back_left_knee_xyz,
+            back_left_toe_xyz,
+            back_right_hip_xyz,
+            back_right_knee_xyz,
+            back_right_toe_xyz,
+        ])
 
         connectivity_mat = np.array(
             [
@@ -265,18 +314,16 @@ class AntWorld(World):
         return points, connectivity_mat
 
     def create_terrain_file(self, filename="terrain.png", width=400, depth=400):
-        # Hill terrain parameters
         slope_deg = 5.0
         bump_scale = 0.1
         sigma = 3.0
 
         rise = np.tan(np.deg2rad(slope_deg))
-        slope_factor = rise
         x = np.linspace(0, 1, depth)
         y = np.linspace(0, 1, width)
         X, Y = np.meshgrid(x, y)
 
-        slope_map = X * slope_factor
+        slope_map = X * rise
 
         rng = np.random.default_rng(42)
         noise = rng.uniform(0, 1, (width, depth))
@@ -294,7 +341,7 @@ class AntWorld(World):
         save_path = os.path.join(self.temp_dir.name, filename)
         img.save(save_path)
 
-    def evaluate_individual(self, genotype, n_repeats=2, n_steps=300):
+    def evaluate_individual(self, genotype, n_repeats=2, n_steps=200):
         self.update_robot_xml(genotype)
         envs = self.create_env(n_envs=n_repeats, max_episode_steps=n_steps)
         self.controller.reset_controller(batch_size=n_repeats)
@@ -305,26 +352,43 @@ class AntWorld(World):
         observations, info = envs.reset()
         done_mask = np.zeros(n_repeats, dtype=bool)
 
+        # switching logic state
+        prev_x_velocity = np.zeros(n_repeats)
+        stuck_counter = np.zeros(n_repeats, dtype=int)
+        recovery_steps = np.zeros(n_repeats, dtype=int)
+
         for step in range(n_steps):
-            actions = np.where(
-                done_mask[:, None],
-                0,
-                self.controller.get_action(observations),
-            )
+            # --- scenario detection for the two-controller MLP ---
+            if isinstance(self.controller, SwitchingMLPController):
+                # if slow for a while, switch to recovery controller
+                moving_slow = np.abs(prev_x_velocity) < 0.02
+                stuck_counter = np.where(moving_slow, stuck_counter + 1, 0)
+
+                # trigger recovery after being slow for long enough
+                trigger_recovery = stuck_counter > 25
+                recovery_steps = np.where(trigger_recovery, 15, recovery_steps)
+
+                recovery_mask = recovery_steps > 0
+                actions = self.controller.get_action(observations, recovery_mask=recovery_mask)
+
+                # count down recovery duration
+                recovery_steps = np.where(recovery_steps > 0, recovery_steps - 1, 0)
+            else:
+                actions = self.controller.get_action(observations)
+
+            actions = np.where(done_mask[:, None], 0, actions)
+
             observations, rewards, dones, truncated, infos = envs.step(actions)
 
             rewards_full[step, ~done_mask] = rewards[~done_mask]
 
-            # Better multi-objective choice for hill locomotion
-            multi_obj_reward = np.array([
-        infos["reward_forward"]
-        - 0.1 * np.abs(infos["y_velocity"])
-        - 0.5 * np.maximum(0.0, -infos["x_velocity"]),
-        -infos["ctrl_cost"]
-    ]).T
+            multi_obj_reward = np.array(
+                [infos["reward_forward"] + infos["healthy_reward"], -infos["ctrl_cost"]-infos["cfrc_cost"]]
+            ).T
             multi_obj_rewards_full[step, ~done_mask] = multi_obj_reward[~done_mask]
 
             done_mask = done_mask | dones | truncated
+            prev_x_velocity = infos["x_velocity"]
 
             if np.all(done_mask):
                 break
@@ -356,7 +420,7 @@ def run_EA_multi(ea_multi, world):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation helpers (kept from your file)
+# Optional evaluation helpers
 # ---------------------------------------------------------------------------
 
 def _run_episodes_hill(world, genotype, n_episodes, max_episode_steps, seed):
@@ -376,18 +440,37 @@ def _run_episodes_hill(world, genotype, n_episodes, max_episode_steps, seed):
         world.controller.reset_controller(batch_size=1)
 
         total_reward = total_obj1 = total_obj2 = 0.0
+        prev_x_velocity = 0.0
+        stuck_counter = 0
+        recovery_steps = 0
+
         for _ in range(max_episode_steps):
-            action = world.controller.get_action(obs)
+            if isinstance(world.controller, SwitchingMLPController):
+                if abs(prev_x_velocity) < 0.02:
+                    stuck_counter += 1
+                else:
+                    stuck_counter = 0
+
+                if stuck_counter > 25:
+                    recovery_steps = 15
+
+                action = world.controller.get_action(obs, recovery_mask=(recovery_steps > 0))
+                if recovery_steps > 0:
+                    recovery_steps -= 1
+            else:
+                action = world.controller.get_action(obs)
+
             if action.ndim > 1:
                 action = action.squeeze(0)
+
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
-            total_obj1 += (
-                float(info.get("reward_forward", 0.0))
-                - 0.1 * abs(float(info.get("y_velocity", 0.0)))
-                - 0.5 * max(0.0, -float(info.get("x_velocity", 0.0)))
+            total_obj1 += float(info.get("reward_forward", 0.0)) + float(
+                info.get("healthy_reward", 0.0)
             )
             total_obj2 += -float(info.get("ctrl_cost", 0.0))
+            prev_x_velocity = float(info.get("x_velocity", 0.0))
+
             if terminated or truncated:
                 break
 
@@ -412,13 +495,35 @@ def _record_video_hill(world, genotype, max_steps, seed, out_path):
         obs, _ = env.reset(seed=seed)
         frames, video_reward = [], 0.0
 
+        prev_x_velocity = 0.0
+        stuck_counter = 0
+        recovery_steps = 0
+
         for _ in range(max_steps):
             frames.append(env.render())
-            action = world.controller.get_action(obs)
+
+            if isinstance(world.controller, SwitchingMLPController):
+                if abs(prev_x_velocity) < 0.02:
+                    stuck_counter += 1
+                else:
+                    stuck_counter = 0
+
+                if stuck_counter > 25:
+                    recovery_steps = 15
+
+                action = world.controller.get_action(obs, recovery_mask=(recovery_steps > 0))
+                if recovery_steps > 0:
+                    recovery_steps -= 1
+            else:
+                action = world.controller.get_action(obs)
+
             if action.ndim > 1:
                 action = action.squeeze(0)
-            obs, reward, terminated, truncated, _ = env.step(action)
+
+            obs, reward, terminated, truncated, info = env.step(action)
             video_reward += reward
+            prev_x_velocity = float(info.get("x_velocity", 0.0))
+
             if terminated or truncated:
                 break
 
@@ -446,7 +551,7 @@ def _stats(values):
 def evaluate_checkpoint(
     checkpoint_dir: str,
     output_dir: str = "evaluation_output",
-    n_episodes: int = 256,
+    n_episodes: int = 32,
 ):
     max_episode_steps: int = 1000
     seed: int = 0
@@ -467,25 +572,18 @@ def evaluate_checkpoint(
 
     population = _try_load("x.npy")
     fitness = _try_load("f.npy")
-    print(f"Loaded x_best  (shape: {x_best.shape})")
+    print(f"Loaded x_best (shape: {x_best.shape})")
 
     if population is not None and fitness is not None and fitness.ndim == 2 and fitness.shape[1] >= 2:
         spec1_idx = int(np.argmax(fitness[:, 0]))
         spec2_idx = int(np.argmax(fitness[:, 1]))
         gen_idx = int(np.argmax(np.sum(fitness, axis=1)))
         spec1_g, spec2_g, gen_g = population[spec1_idx], population[spec2_idx], population[gen_idx]
-        print(f"Specialist obj1 (forward): idx={spec1_idx}  f={fitness[spec1_idx]}")
-        print(f"Specialist obj2 (effic.) : idx={spec2_idx}  f={fitness[spec2_idx]}")
-        print(f"Generalist (best sum)    : idx={gen_idx}    f={fitness[gen_idx]}")
     else:
-        print("Warning: population/fitness not found — using x_best for all three roles.")
         spec1_g = spec2_g = gen_g = x_best
 
     world = AntWorld()
     controller_name = type(world.controller).__name__
-    print(
-        f"Controller: {controller_name}  |  params={world.controller.n_params}  |  genotype size={world.n_params}\n"
-    )
 
     individuals = {
         "specialist_obj1": spec1_g,
@@ -511,30 +609,13 @@ def evaluate_checkpoint(
         )
 
     os.makedirs(output_dir, exist_ok=True)
-    video_names = {
-        "specialist_obj1": "specialist_forward",
-        "specialist_obj2": "specialist_efficiency",
-        "generalist": "generalist",
-    }
-    for label, genotype in individuals.items():
-        vpath = os.path.join(output_dir, f"evaluation_{video_names[label]}.mp4")
-        _record_video_hill(world, genotype, max_episode_steps, seed, vpath)
-
-    score_path = os.path.join(output_dir, "evaluation_score.txt")
-    with open(score_path, "w") as f:
-        f.write("=" * 60 + "\n")
-        f.write("MICRO-515 Challenge 3 - Evaluation Results\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Controller      : {controller_name} ({world.controller.n_params} params)\n")
-        f.write(f"Genotype size   : {world.n_params}  (weights={world.controller.n_params}, body={world.n_body_params})\n")
-        f.write(f"Checkpoint      : {checkpoint_dir}\n")
-        f.write(f"Episodes/indiv. : {n_episodes}\n")
-        f.write("Objectives      : [reward_forward+healthy_reward, -ctrl_cost]\n\n")
-
-    print(f"\nScore saved to: {score_path}")
     return results
+
+
 def main():
-    #%% Understanding the world / baseline MLP transfer
+    # ------------------------------------------------------------------
+    # 1) Baseline transferred single MLP (unchanged)
+    # ------------------------------------------------------------------
     world = AntWorld()
     n_parameters = world.n_params
 
@@ -560,36 +641,35 @@ def main():
     print("Expected weights:", world.n_weights)
 
     genotype[:-8] = prev_best
-
-    # fixed morphology: upper = 0.2m, lower = 0.6m
-    genotype[-8::2] = 4 * (0.2 - 0.1) - 1
-    genotype[-7::2] = 4 * (0.6 - 0.1) - 1
+    genotype[-8::2] = length_to_genotype(0.2)
+    genotype[-7::2] = length_to_genotype(0.6)
 
     world.update_robot_xml(genotype)
     world.visualise_individual(genotype)
 
-    #%% Evolve open-loop SO2 + body with CMA-ES
+    # ------------------------------------------------------------------
+    # 2) SO2 + body with CMA-ES
+    # ------------------------------------------------------------------
     world = AntWorld()
     world.n_weights = world.controller.n_params
     world.n_params = world.n_weights + world.n_body_params
     n_parameters = world.n_params
 
     population_size = 130
-    num_generations = 1
+    num_generations =10
 
     results_dir = join(ROOT_DIR, "results", ENV_NAME, "single_so2")
     ea_single = EvoAlgAPI(
         n_params=n_parameters,
         population_size=population_size,
         num_generations=num_generations,
-        sigma=0.2,
+        sigma=0.1,
         bounds=(-1, 1),
         output_dir=results_dir,
     )
 
     run_EA_single(ea_single, world)
 
-    #%% visualise SO2
     checkpoint = get_last_checkpoint_dir(results_dir)
     best_individual = np.load(join(results_dir, checkpoint, "x_best.npy"))
     world.update_robot_xml(best_individual)
@@ -599,9 +679,11 @@ def main():
     world.generate_best_individual_video(env, video_name=video_name, n_steps=500)
     env.close()
 
-    #%% Evolve MLP + body with CMA-ES
+    # ------------------------------------------------------------------
+    # 3) TWO-CONTROLLER MLP + body with CMA-ES
+    # ------------------------------------------------------------------
     world = AntWorld()
-    world.controller = NeuralNetworkController(
+    world.controller = SwitchingMLPController(
         input_size=27,
         output_size=8,
         hidden_size=8,
@@ -610,35 +692,37 @@ def main():
     world.n_params = world.n_weights + world.n_body_params
     n_parameters = world.n_params
 
-    print("MLP CMA-ES parameters:", n_parameters)
-    print("MLP CMA-ES weights:", world.n_weights)
+    print("Switching MLP CMA-ES parameters:", n_parameters)
+    print("Switching MLP weights:", world.n_weights)
 
     population_size = 130
-    num_generations = 100
+    num_generations =10
 
-    results_dir = join(ROOT_DIR, "results", ENV_NAME, "single_mlp")
+    results_dir = join(ROOT_DIR, "results", ENV_NAME, "single_switching_mlp")
     ea_single = EvoAlgAPI(
         n_params=n_parameters,
         population_size=population_size,
         num_generations=num_generations,
-        sigma=0.2,
+        sigma=0.1,
         bounds=(-1, 1),
         output_dir=results_dir,
     )
 
     run_EA_single(ea_single, world)
 
-    #%% visualise MLP CMA-ES
     checkpoint = get_last_checkpoint_dir(results_dir)
     best_individual = np.load(join(results_dir, checkpoint, "x_best.npy"))
     world.update_robot_xml(best_individual)
     env = world.create_env(max_episode_steps=-1)
     video_name = get_distinct_filename(join(results_dir, "best.mp4"))
-    print(f"Finished MLP ES run, generating video [{video_name}]...")
+    print(f"Finished Switching MLP ES run, generating video [{video_name}]...")
     world.generate_best_individual_video(env, video_name=video_name, n_steps=500)
     env.close()
 
-    #%% Optimise multi-objective with NSGA-II (MLP + body)
+    # ------------------------------------------------------------------
+    # 4) NSGA-II kept on single MLP to avoid exploding search dimension
+    #    If you want, you can later switch this to SwitchingMLPController too.
+    # ------------------------------------------------------------------
     world = AntWorld()
     world.controller = NeuralNetworkController(
         input_size=27,
@@ -652,14 +736,14 @@ def main():
     print("Number of parameters:", n_parameters)
     print("Number of weights:", world.n_weights)
 
-    population_size = 100
+    population_size = 130
     opts = {}
     opts["min"] = -1
     opts["max"] = 1
     opts["num_parents"] = 60
-    opts["num_generations"] = 100
+    opts["num_generations"] =100
     opts["mutation_prob"] = 0.2
-    opts["crossover_prob"] = 0.7
+    opts["crossover_prob"] = 0.5
 
     results_dir = join(ROOT_DIR, "results", ENV_NAME, "multi")
     ea_multi_obj = NSGAII(
@@ -674,7 +758,6 @@ def main():
     ea_multi_obj.directory_name = results_dir
     run_EA_multi(ea_multi_obj, world)
 
-    #%% visualise NSGA-II
     checkpoint = get_last_checkpoint_dir(results_dir)
     best_individual = np.load(join(results_dir, checkpoint, "x_best.npy"), allow_pickle=True)
     best_individual = np.asarray(best_individual).squeeze()
@@ -683,8 +766,9 @@ def main():
     print("world.n_params:", world.n_params)
     print("world.n_weights:", world.n_weights)
 
-    assert best_individual.shape[0] == world.n_params, \
+    assert best_individual.shape[0] == world.n_params, (
         f"Mismatch: genotype has {best_individual.shape[0]} params but world expects {world.n_params}"
+    )
 
     world.update_robot_xml(best_individual)
     env = world.create_env(max_episode_steps=-1)
@@ -693,7 +777,9 @@ def main():
     world.generate_best_individual_video(env, video_name=video_name, n_steps=500)
     env.close()
 
-    #%% Bonus: Hebbian + body with CMA-ES
+    # ------------------------------------------------------------------
+    # 5) Hebbian + body with CMA-ES
+    # ------------------------------------------------------------------
     world = AntWorld()
     world.controller = HebbianController(
         input_size=27,
@@ -708,21 +794,20 @@ def main():
     print("Total search dim:", world.n_params)
 
     population_size = 130
-    num_generations = 100
+    num_generations =10
 
     results_dir = join(ROOT_DIR, "results", ENV_NAME, "hebbian")
     ea_single = EvoAlgAPI(
         n_params=n_parameters,
         population_size=population_size,
         num_generations=num_generations,
-        sigma=0.2,
+        sigma=0.1,
         bounds=(-1, 1),
         output_dir=results_dir,
     )
 
     run_EA_single(ea_single, world)
 
-    #%% visualise Hebbian
     checkpoint = get_last_checkpoint_dir(results_dir)
     best_individual = np.load(join(results_dir, checkpoint, "x_best.npy"))
     world.update_robot_xml(best_individual)

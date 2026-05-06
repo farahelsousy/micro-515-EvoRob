@@ -30,9 +30,9 @@ class AntHillEnv(MujocoEnv, utils.EzPickle):
         robot_path: str,
         frame_skip: int = 5,
         default_camera_config: Dict[str, float] = DEFAULT_CAMERA_CONFIG,
-        forward_reward_weight: float = 1,
-        ctrl_cost_weight: float = 0.5,
-        cfrc_cost_weight: float = 5e-4,
+        forward_reward_weight: float = 2.0,
+        ctrl_cost_weight: float = 0.1,
+        cfrc_cost_weight: float = 1e-5,
         main_body: Union[int, str] = 1,
         reset_noise_scale: float = 0.1,
         exclude_current_positions_from_observation: bool = True,
@@ -124,14 +124,30 @@ class AntHillEnv(MujocoEnv, utils.EzPickle):
 
         xyz_velocity = (xyz_position_after - xyz_position_before) / self.dt
         x_velocity, y_velocity, z_velocity = xyz_velocity
+        R = self.data.body(self._main_body).xmat.reshape(3, 3)
+        torso_z_world = R[:, 2]
+        torso_height = self.data.qpos[2]
 
+        trip_penalty = 0.0
+
+        # body too low / near fall
+        if torso_height < 0.22:
+            trip_penalty += 5.0 * (0.22 - torso_height)
+
+        # body tilt
+        trip_penalty += 0.1 * (1.0 - torso_z_world[2])
+
+        # sudden downward drop
+        trip_penalty += 0.2 * max(0.0, -z_velocity)
         forward_reward = x_velocity * self._forward_reward_weight
+        lateral_penalty = 0.1 * abs(y_velocity)
+        backward_penalty = 0.2 * max(0.0, -x_velocity)
         healthy_reward = 1
-        ctrl_cost = np.sum(action**2)  * self._ctrl_cost_weight
-        cfrc_cost = np.sum( self.data.cfrc_ext[1:]**2) * self._cfrc_cost_weight
+        height_reward = 0.1 * z_velocity
+        ctrl_cost = np.sum(action**2) * self._ctrl_cost_weight
+        cfrc_cost = np.sum(self.data.cfrc_ext[1:]**2) * self._cfrc_cost_weight
 
-        #TODO change the reward for hill terrain
-        reward = healthy_reward + forward_reward -ctrl_cost -cfrc_cost
+        reward = healthy_reward + forward_reward  - ctrl_cost 
         observation = self._get_obs()
 
         info = {
@@ -146,18 +162,32 @@ class AntHillEnv(MujocoEnv, utils.EzPickle):
             "y_velocity": y_velocity,
             "z_velocity": z_velocity,
         }
+
         terminated = False
-        # Check for NaN, Inf, or huge values
+
         qacc = self.data.qacc
         mask = np.isnan(qacc) | np.isinf(qacc) | (np.abs(qacc) > 1e6)
-        # TODO: Re-define termination for slope environment and design appropriate rewards
         if np.any(mask):
-            DOF = np.argwhere((np.isnan(qacc)) + (np.isinf(qacc)) + (np.abs(qacc) > 1e6)).squeeze()[0]
-            print(ValueError(f'MuJoCo Warning: Nan, Inf or huge value in QACC at DOF {DOF}'))
+            DOF = np.argwhere(mask).squeeze()[0]
+            print(ValueError(f"MuJoCo Warning: Nan, Inf or huge value in QACC at DOF {DOF}"))
             terminated = True
-        if self.data.qpos[2] < 0.2 or self.data.qpos[2] > 1.0:
+
+        if self.data.qpos[2] < 0.15 or self.data.qpos[2] > 1.2:
             terminated = True
+
+        if self.torso_upside_down():
+            terminated = True
+
+        if abs(x_velocity) < 0.02:
+            self.stuck += 1
+        else:
+            self.stuck = 0
+
+        if self.stuck > 50:
+            terminated = True
+
         if terminated:
+            reward -= 10
             info["healthy_reward"] = -10
 
         self.previous_state = observation
@@ -170,6 +200,8 @@ class AntHillEnv(MujocoEnv, utils.EzPickle):
         R = self.data.body(self._main_body).xmat.reshape(3, 3)
         torso_z_world = R[:, 2]
         # if dot(torso_z, world_z) < 0 → pointing downward → upside down
+        
+        
         return torso_z_world[2] < 0.0
 
     def _get_obs(self):
