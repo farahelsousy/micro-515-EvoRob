@@ -110,7 +110,7 @@ class AntFlatEnvironment(MujocoEnv):
         healthy_reward_weight = 1.0
         ctrl_cost_weight = 0.5
 
-        forward_reward = x_velocity * forward_reward_weight
+        forward_reward = x_position 
         healthy_reward = healthy_reward_weight
         ctrl_cost = ctrl_cost_weight * np.sum(np.square(action))
 

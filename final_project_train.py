@@ -63,7 +63,7 @@ class FinalWorld(World):
         )
 
         self.n_weights     = self.controller.n_params
-        self.n_body_params = 8          # 4 legs × (upper + lower segment length)
+        self.n_body_params = 4          # 4 legs × (upper + lower segment length)
         self.n_params      = self.n_weights + self.n_body_params
 
         # Temporary directory holds AntRobot.xml + one combined world XML per terrain
@@ -116,7 +116,13 @@ class FinalWorld(World):
         body_params    = (genotype[self.n_weights:] + 1) / 4 + 0.1
         self.controller.geno2pheno(control_params)
 
-        front_left_leg, front_left_ankle, front_right_leg, front_right_ankle, back_left_leg, back_left_ankle, back_right_leg, back_right_ankle, = body_params
+        front_upper, front_lower, rear_upper, rear_lower = body_params
+
+        front_left_leg = front_right_leg = front_upper
+        front_left_ankle = front_right_ankle = front_lower
+
+        back_left_leg = back_right_leg = rear_upper
+        back_left_ankle = back_right_ankle = rear_lower
 
         # Define the 3D coordinates of the relative tree structure
         front_left_hip_xyz = np.array([0.2, 0.2, 0])
