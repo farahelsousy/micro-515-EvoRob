@@ -6,18 +6,18 @@ Controller : SmoothedHebbianMLPController  (584 params)
 Genotype   : 588 params  (controller=584, body=4)
 Reward     : healthy_reward + x_position - ctrl_cost - cfrc_cost
 
-Mean  : 377.94
-Std   : 1487.67
-Best  : 3545.75
-Worst : -1810.23
+Mean  : -217.20
+Std   : 2103.62
+Best  : 4660.10
+Worst : -3488.83
 
-Episode   1:    2050.52
-Episode   2:    1374.36
-Episode   3:    3545.75
-Episode   4:    -667.06
-Episode   5:    -771.13
-Episode   6:     261.26
-Episode   7:   -1810.23
-Episode   8:    -563.67
-Episode   9:     431.91
-Episode  10:     -72.28
+Episode   1:   -1409.30
+Episode   2:   -1955.73
+Episode   3:   -3488.83
+Episode   4:     921.91
+Episode   5:     149.12
+Episode   6:    1012.08
+Episode   7:   -1152.33
+Episode   8:   -1287.18
+Episode   9:     378.21
+Episode  10:    4660.10

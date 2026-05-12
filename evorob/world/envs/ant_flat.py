@@ -105,19 +105,26 @@ class AntFlatEnvironment(MujocoEnv):
 
         return np.concatenate((position, velocity))
 
-    def _get_rew(self, x_progress: float, action):
+    def _get_rew(self, x_progress: float, y_progress: float, height: float, action):
         healthy_reward = 1.0
-        ctrl_cost_weight = 0.1
+
+        ctrl_cost_weight = 0.35
         ctrl_cost = ctrl_cost_weight * np.sum(np.square(action))
 
-        forward_reward = 40.0 * x_progress
-        backward_penalty = 2.0 * max(0.0, -x_progress)
-        y_progress = xy_position_after[1] - xy_position_before[1]
-        lateral_penalty = 0.5 * abs(y_progress)
-        height = xyz_position_after[2]
-        upright_bonus = 0.5 * np.clip((height - 0.2) / (0.6 - 0.2), 0.0, 1.0)
-        reward = healthy_reward + forward_reward - ctrl_cost    - backward_penalty - lateral_penalty + upright_bonus
+        forward_reward = 20.0 * x_progress
+        backward_penalty = 8.0 * max(0.0, -x_progress)
+        lateral_penalty = 2.0 * abs(y_progress)
 
+        upright_bonus = 0.25 * np.clip((height - 0.2) / (0.6 - 0.2), 0.0, 1.0)
+
+        reward = (
+            healthy_reward
+            + forward_reward
+            + upright_bonus
+            - ctrl_cost
+            - backward_penalty
+            - lateral_penalty
+        )
 
         reward_info = {
             "reward_forward": forward_reward,
@@ -126,15 +133,6 @@ class AntFlatEnvironment(MujocoEnv):
             "cfrc_cost": 0.0,
             "reward_ctrl": -ctrl_cost,
             "reward_survive": healthy_reward,
-            "x_position": self.data.qpos[0],
-            "y_position": self.data.qpos[1],
         }
 
         return reward, reward_info
-
-    def _get_termination(self):
-        state = self.state_vector()
-        min_z_torso, max_z_torso = (0.26, 1.0)
-        is_healthy = np.isfinite(state).all() and min_z_torso <= state[2] <= max_z_torso
-
-        return not is_healthy

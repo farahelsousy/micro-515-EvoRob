@@ -113,10 +113,11 @@ class FinalWorld(World):
         #front_upper, front_lower, rear_upper, rear_lower = body_params
         body_raw = genotype[self.n_weights:]
 
-        front_upper = 0.2 + 0.1 * body_raw[0]
-        front_lower = 0.4 + 0.1 * body_raw[1]
-        rear_upper  = 0.2 + 0.1 * body_raw[2]
-        rear_lower  = 0.4 + 0.1 * body_raw[3]
+        front_upper = 0.20 + 0.05 * body_raw[0]
+        front_lower = 0.40 + 0.05 * body_raw[1]
+
+        rear_upper  = 0.20 + 0.05 * body_raw[2]
+        rear_lower  = 0.40 + 0.05 * body_raw[3]
         front_left_leg = front_right_leg = front_upper
         front_left_ankle = front_right_ankle = front_lower
 
@@ -591,13 +592,13 @@ def run_multi_task_evolution(
 
 if __name__ == "__main__":
     run_multi_task_evolution(
-        num_generations=80,
+        num_generations=500,
         population_size=48,
         n_parents=16,
         n_repeats=1,
         n_steps=500,
-        mutation_prob=0.7,
-        crossover_prob=0.6,
+        mutation_prob=0.4,
+        crossover_prob=0.5,
         ckpt_interval=5,
         results_dir=join(ROOT_DIR, "results", "sweep_explore"),
     )
