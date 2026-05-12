@@ -25,13 +25,13 @@ import gymnasium as gym
 import numpy as np
 import scipy.ndimage
 from PIL import Image
-from gymnasium.vector import AsyncVectorEnv
+from gymnasium.vector import SyncVectorEnv
 
 import evorob.world                         # registers EvalEnv-v0
-from evorob.algorithms.nsga_sol import NSGAII
+from evorob.algorithms.nsga import NSGAII
 from evorob.utils.filesys import get_last_checkpoint_dir, get_project_root
 from evorob.world.base import World
-from evorob.world.robot.controllers.mlp_sol import NeuralNetworkController
+from evorob.world.robot.controllers.smoothedhebbian import SmoothedHebbianMLPController
 from evorob.world.robot.morphology.ant_custom_robot import AntRobot
 
 ROOT_DIR = get_project_root()
@@ -52,18 +52,15 @@ class FinalWorld(World):
     """
 
     def __init__(self):
-        # Choose your controller — swap for your own MLP, SO2Controller, Hebbian, or custom.
-        # Whatever you choose determines self.n_weights (controller parameter count).
-        #
-        # from evorob.world.robot.controllers.mlp import NeuralNetworkController  # your impl
-        # from evorob.world.robot.controllers.so2 import SO2Controller
-        # self.controller = SO2Controller(input_size=27, output_size=8, hidden_size=8)
-        self.controller = NeuralNetworkController(
+        # Hebbian-smoothed MLP controller.
+        # Make sure evorob/world/robot/controllers/smoothedhebbian.py exists
+        # and contains SmoothedHebbianMLPController.
+        self.controller = SmoothedHebbianMLPController(
             input_size=27, output_size=8, hidden_size=8
         )
 
         self.n_weights     = self.controller.n_params
-        self.n_body_params = 4          # 4 legs × (upper + lower segment length)
+        self.n_body_params = 4          # symmetric body: front upper/lower, rear upper/lower
         self.n_params      = self.n_weights + self.n_body_params
 
         # Temporary directory holds AntRobot.xml + one combined world XML per terrain
@@ -88,13 +85,7 @@ class FinalWorld(World):
         ]
 
         # Custom sensor function — intercepts the raw env observation before it
-        # reaches the controller.  Set to any callable obs -> obs' to filter,
-        # augment, or reshape observations.  The controller input_size must match
-        # the output of this function.
-        #
-        # Example — use only joint angles and velocities (14 values):
-        #   self.sensor_fn = lambda obs: obs[:14]
-        #   self.controller = NeuralNetworkController(input_size=14, ...)
+        # reaches the controller. The controller input_size must match the output.
         self.sensor_fn = None
 
         self._create_terrain_file("terrain.png")
@@ -104,11 +95,14 @@ class FinalWorld(World):
     # ------------------------------------------------------------------
 
     def geno2pheno(self, genotype: np.ndarray):
-        """Decode genotype into controller weights and body parameters.
+        """Decode genotype into controller weights and symmetric body parameters.
 
         Splits genotype into:
-          genotype[:n_weights]  → controller (scaled by 0.1 before loading)
-          genotype[n_weights:]  → 8 leg-segment lengths via (g+1)/4 + 0.1
+          genotype[:n_weights]  → controller parameters, scaled by 0.1
+          genotype[n_weights:]  → 4 symmetric leg-segment lengths via (g+1)/4 + 0.1
+
+        Body parameters:
+          front_upper, front_lower, rear_upper, rear_lower
 
         Returns (points, connectivity_mat) for AntRobot construction.
         """
@@ -116,8 +110,13 @@ class FinalWorld(World):
         body_params    = (genotype[self.n_weights:] + 1) / 4 + 0.1
         self.controller.geno2pheno(control_params)
 
-        front_upper, front_lower, rear_upper, rear_lower = body_params
+        #front_upper, front_lower, rear_upper, rear_lower = body_params
+        body_raw = genotype[self.n_weights:]
 
+        front_upper = 0.2 + 0.1 * body_raw[0]
+        front_lower = 0.4 + 0.1 * body_raw[1]
+        rear_upper  = 0.2 + 0.1 * body_raw[2]
+        rear_lower  = 0.4 + 0.1 * body_raw[3]
         front_left_leg = front_right_leg = front_upper
         front_left_ankle = front_right_ankle = front_lower
 
@@ -126,34 +125,67 @@ class FinalWorld(World):
 
         # Define the 3D coordinates of the relative tree structure
         front_left_hip_xyz = np.array([0.2, 0.2, 0])
-        front_left_knee_xyz = np.array([np.sqrt(0.5 * front_left_leg ** 2), np.sqrt(0.5 * front_left_leg ** 2), 0]) + front_left_hip_xyz
-        front_left_toe_xyz = np.array([np.sqrt(0.5 * front_left_ankle ** 2), np.sqrt(0.5 * front_left_ankle ** 2), 0]) + front_left_knee_xyz
+        front_left_knee_xyz = np.array([
+            np.sqrt(0.5 * front_left_leg ** 2),
+            np.sqrt(0.5 * front_left_leg ** 2),
+            0,
+        ]) + front_left_hip_xyz
+        front_left_toe_xyz = np.array([
+            np.sqrt(0.5 * front_left_ankle ** 2),
+            np.sqrt(0.5 * front_left_ankle ** 2),
+            0,
+        ]) + front_left_knee_xyz
 
         front_right_hip_xyz = np.array([-0.2, 0.2, 0])
-        front_right_knee_xyz = np.array([-np.sqrt(0.5 * front_right_leg ** 2), np.sqrt(0.5 * front_right_leg ** 2), 0]) + front_right_hip_xyz
-        front_right_toe_xyz = np.array([-np.sqrt(0.5 * front_right_ankle ** 2), np.sqrt(0.5 * front_right_ankle ** 2), 0]) + front_right_knee_xyz
+        front_right_knee_xyz = np.array([
+            -np.sqrt(0.5 * front_right_leg ** 2),
+            np.sqrt(0.5 * front_right_leg ** 2),
+            0,
+        ]) + front_right_hip_xyz
+        front_right_toe_xyz = np.array([
+            -np.sqrt(0.5 * front_right_ankle ** 2),
+            np.sqrt(0.5 * front_right_ankle ** 2),
+            0,
+        ]) + front_right_knee_xyz
 
         back_left_hip_xyz = np.array([-0.2, -0.2, 0])
-        back_left_knee_xyz = np.array([-np.sqrt(0.5 * back_left_leg ** 2), -np.sqrt(0.5 * back_left_leg ** 2), 0]) + back_left_hip_xyz
-        back_left_toe_xyz = np.array([-np.sqrt(0.5 * back_left_ankle ** 2), -np.sqrt(0.5 * back_left_ankle ** 2), 0]) + back_left_knee_xyz
+        back_left_knee_xyz = np.array([
+            -np.sqrt(0.5 * back_left_leg ** 2),
+            -np.sqrt(0.5 * back_left_leg ** 2),
+            0,
+        ]) + back_left_hip_xyz
+        back_left_toe_xyz = np.array([
+            -np.sqrt(0.5 * back_left_ankle ** 2),
+            -np.sqrt(0.5 * back_left_ankle ** 2),
+            0,
+        ]) + back_left_knee_xyz
 
         back_right_hip_xyz = np.array([0.2, -0.2, 0])
-        back_right_knee_xyz = np.array([np.sqrt(0.5 * back_right_leg ** 2), -np.sqrt(0.5 * back_right_leg ** 2), 0]) + back_right_hip_xyz
-        back_right_toe_xyz = np.array([np.sqrt(0.5 * back_right_ankle ** 2), -np.sqrt(0.5 * back_right_ankle ** 2), 0]) + back_right_knee_xyz
+        back_right_knee_xyz = np.array([
+            np.sqrt(0.5 * back_right_leg ** 2),
+            -np.sqrt(0.5 * back_right_leg ** 2),
+            0,
+        ]) + back_right_hip_xyz
+        back_right_toe_xyz = np.array([
+            np.sqrt(0.5 * back_right_ankle ** 2),
+            -np.sqrt(0.5 * back_right_ankle ** 2),
+            0,
+        ]) + back_right_knee_xyz
 
-        points = np.vstack([front_left_hip_xyz,
-                            front_left_knee_xyz,
-                            front_left_toe_xyz,
-                            front_right_hip_xyz,
-                            front_right_knee_xyz,
-                            front_right_toe_xyz,
-                            back_left_hip_xyz,
-                            back_left_knee_xyz,
-                            back_left_toe_xyz,
-                            back_right_hip_xyz,
-                            back_right_knee_xyz,
-                            back_right_toe_xyz,
-                            ])
+        points = np.vstack([
+            front_left_hip_xyz,
+            front_left_knee_xyz,
+            front_left_toe_xyz,
+            front_right_hip_xyz,
+            front_right_knee_xyz,
+            front_right_toe_xyz,
+            back_left_hip_xyz,
+            back_left_knee_xyz,
+            back_left_toe_xyz,
+            back_right_hip_xyz,
+            back_right_knee_xyz,
+            back_right_toe_xyz,
+        ])
 
         # define the type of connections [FIXED ARCHITECTURE]
         connectivity_mat = np.array(
@@ -235,7 +267,7 @@ class FinalWorld(World):
 
     def _run_env(self, env_id: str, world_file: str, n_repeats: int, n_steps: int) -> float:
         """Run n_repeats parallel episodes and return the mean total reward."""
-        envs = AsyncVectorEnv([
+        envs = SyncVectorEnv([
             (lambda eid, wf: lambda: gym.make(
                 eid, robot_path=wf, max_episode_steps=n_steps
             ))(env_id, world_file)
@@ -558,13 +590,14 @@ def run_multi_task_evolution(
 
 
 if __name__ == "__main__":
-    # Quick smoke-test — 2 generations, tiny population
     run_multi_task_evolution(
-        num_generations=100,
-        population_size=32,
-        n_parents=32,
-        n_repeats=2,
-        n_steps=100,
-        ckpt_interval=1,
-        results_dir=join(ROOT_DIR, "results", "final_test"),
+        num_generations=80,
+        population_size=48,
+        n_parents=16,
+        n_repeats=1,
+        n_steps=500,
+        mutation_prob=0.7,
+        crossover_prob=0.6,
+        ckpt_interval=5,
+        results_dir=join(ROOT_DIR, "results", "sweep_explore"),
     )

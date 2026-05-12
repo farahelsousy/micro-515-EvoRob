@@ -6,8 +6,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
-os.environ.setdefault("MUJOCO_GL", "egl")
-
+os.environ.setdefault("MUJOCO_GL", "glfw")
 from evorob.utils.filesys import get_last_checkpoint_dir, get_project_root
 from evorob.world.base import World
 from evorob.world.robot.controllers.base import Controller
@@ -41,10 +40,11 @@ class EvalWorld(World):
     """
 
     def __init__(self):
-        self.controller = self._default_controller()
+        self.controller = self._default_controller(self)
         self.n_weights = self.controller.n_params
-        self.n_body_params = 8          # 4 legs × (upper, lower)
+        self.n_body_params = 4          # 4 legs × (upper, lower)
         self.n_params = self.n_weights + self.n_body_params
+        self.sensor_fn = None
 
         self.temp_dir = TemporaryDirectory()
         # self.world_file is the tmp copy of eval_terrain.xml with the robot injected
@@ -72,9 +72,13 @@ class EvalWorld(World):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _default_controller():
-        from evorob.world.robot.controllers.mlp_sol import NeuralNetworkController
-        return NeuralNetworkController(input_size=27, output_size=8, hidden_size=8)
+    def _default_controller(self):
+        from evorob.world.robot.controllers.smoothedhebbian import SmoothedHebbianMLPController
+        return SmoothedHebbianMLPController(
+            input_size=27,
+            output_size=8,
+            hidden_size=8,
+        )
 
     def set_controller(self, controller: Controller) -> None:
         """Override the default MLP controller.

@@ -105,21 +105,29 @@ class AntFlatEnvironment(MujocoEnv):
 
         return np.concatenate((position, velocity))
 
-    def _get_rew(self, x_velocity: float, action):
-        forward_reward_weight = 1.0
-        healthy_reward_weight = 1.0
-        ctrl_cost_weight = 0.5
-
-        forward_reward = x_position 
-        healthy_reward = healthy_reward_weight
+    def _get_rew(self, x_progress: float, action):
+        healthy_reward = 1.0
+        ctrl_cost_weight = 0.1
         ctrl_cost = ctrl_cost_weight * np.sum(np.square(action))
 
-        reward = forward_reward + healthy_reward - ctrl_cost
+        forward_reward = 40.0 * x_progress
+        backward_penalty = 2.0 * max(0.0, -x_progress)
+        y_progress = xy_position_after[1] - xy_position_before[1]
+        lateral_penalty = 0.5 * abs(y_progress)
+        height = xyz_position_after[2]
+        upright_bonus = 0.5 * np.clip((height - 0.2) / (0.6 - 0.2), 0.0, 1.0)
+        reward = healthy_reward + forward_reward - ctrl_cost    - backward_penalty - lateral_penalty + upright_bonus
+
 
         reward_info = {
             "reward_forward": forward_reward,
+            "healthy_reward": healthy_reward,
+            "ctrl_cost": ctrl_cost,
+            "cfrc_cost": 0.0,
             "reward_ctrl": -ctrl_cost,
             "reward_survive": healthy_reward,
+            "x_position": self.data.qpos[0],
+            "y_position": self.data.qpos[1],
         }
 
         return reward, reward_info

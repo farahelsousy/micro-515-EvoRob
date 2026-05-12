@@ -157,7 +157,7 @@ class NSGAII(EA):
                     self.f_best_so_far = current_best_fitness
                     self.x_best_so_far = current_best_x
 
-        if self.current_gen % 5 == 0:
+        if self.current_gen % 2 == 0:
             print(f"Generation {self.current_gen}:\t{self.f_best_so_far}")
             print(f"Mean fitness:\t{self.f.mean():.2f} +- {self.f.std():.2f}")
             means = np.mean(fitness, axis=0)

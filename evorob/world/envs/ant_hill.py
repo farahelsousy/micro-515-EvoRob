@@ -125,13 +125,27 @@ class AntHillEnv(MujocoEnv, utils.EzPickle):
         xyz_velocity = (xyz_position_after - xyz_position_before) / self.dt
         x_velocity, y_velocity, z_velocity = xyz_velocity
 
-        forward_reward = x_velocity * self._forward_reward_weight
+        #forward_reward = x_velocity * self._forward_reward_weight
         healthy_reward = 1
         ctrl_cost = np.sum(action**2)  * self._ctrl_cost_weight
         cfrc_cost = np.sum( self.data.cfrc_ext[1:]**2) * self._cfrc_cost_weight
 
         #TODO change the reward for hill terrain
-        reward = healthy_reward + forward_reward -ctrl_cost -cfrc_cost
+        x_progress = xyz_position_after[0] - xyz_position_before[0]
+        z_progress = xyz_position_after[2] - xyz_position_before[2] 
+        forward_reward = 5.0 * x_progress
+        height_reward = 1.0 * z_progress        
+        height = xyz_position_after[2]
+        upright_bonus = 0.5 * np.clip((height - 0.2) / (0.6 - 0.2), 0.0, 1.0)
+        if abs(x_progress) < 1e-3:
+            stuck_penalty = 0.1
+        else:
+            stuck_penalty = 0.0
+
+        reward -= stuck_penalty
+        reward = healthy_reward + forward_reward -ctrl_cost -cfrc_cost + height_reward  + upright_bonus - stuck_penalty
+
+
         observation = self._get_obs()
 
         info = {
@@ -145,6 +159,9 @@ class AntHillEnv(MujocoEnv, utils.EzPickle):
             "x_velocity": x_velocity,
             "y_velocity": y_velocity,
             "z_velocity": z_velocity,
+            "x_progress": x_progress,
+            "z_progress": z_progress,
+            "stuck_penalty": stuck_penalty,
         }
         terminated = False
         # Check for NaN, Inf, or huge values
